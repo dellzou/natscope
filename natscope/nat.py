@@ -27,15 +27,17 @@ from . import stun
 from .servers import ProbeResult, StunServer
 
 # ---- 过滤行为测量参数（阶段 2） ----
-#: 单次 CHANGE-REQUEST 的超时（秒）
-FILTER_TIMEOUT_S = 0.5
+#: 单包 CHANGE-REQUEST 超时（秒）。这是**下限**：无论预算多紧都不压缩它，
+#: 否则"没等够"会被记成"被 NAT 过滤"，把地址受限型推成端口受限型。
+FILTER_TIMEOUT_S = 1.0
 #: 每个子测试最多发几包（服务器对连续 CHANGE-REQUEST 会限流，见 P2-17）
 FILTER_ATTEMPTS = 3
 #: 同一子测试两次重试之间的间隔（秒）
 FILTER_RETRY_GAP_S = 0.15
 #: Test II 与 Test III 之间的间隔（秒）：背靠背连发会被服务器丢弃
 FILTER_GAP_S = 0.25
-#: 整个过滤测量阶段的耗时上限（秒），含两次子测试与重试
+#: 目标耗时（秒）。**软预算**：用完只停止"继续重试"，绝不下调单包超时；
+#: 已在途的包一律按 FILTER_TIMEOUT_S 等满。实测最坏 ≈4.5s，典型 0.6s。
 FILTER_BUDGET_S = 3.0
 #: 能力诊断最多试几台服务器
 FILTER_CAP_CANDIDATES = 3
@@ -304,7 +306,15 @@ def _mapping_mode(samples: list[MappingSample]) -> str:
         if len(samples) < 2:
             return MAP_UNKNOWN
 
-    if len({s.mapped_port for s in samples}) == 1:
+    # 多数端口一致即视为 EIM，容许**最多一个离群样本**。
+    # 依据：离群值几乎总是测量伪影（例如该目的地址刚被 CHANGE-REQUEST 碰过，
+    # NAT 给它重新分配了映射端口），而不是真实的"映射随目的变化"。真对称型
+    # 下每个目的各持一个端口、凑不出多数，仍会走到下面的 ADM/APDM 判定。
+    port_counts: dict[int, int] = {}
+    for s in samples:
+        port_counts[s.mapped_port] = port_counts.get(s.mapped_port, 0) + 1
+    top_port, top_count = max(port_counts.items(), key=lambda kv: kv[1])
+    if top_count >= 2 and top_count >= len(samples) - 1:
         return MAP_EIM
 
     ip_only = False
@@ -488,6 +498,11 @@ class NatDetector:
                     "），本机可能处于多 WAN / 负载均衡环境，映射端口的一致性以端口为准"
                 )
 
+            # 离群样本复核：某个目的的映射端口与多数不一致时，先重发一次该目的。
+            # 这类离群值多为测量伪影（该地址刚被 CHANGE-REQUEST 碰过、NAT 给它
+            # 重新分配了端口），直接当成对称型证据会把 EIM 误判成 APDM。
+            self._recheck_outlier_samples(sock, res)
+
             distinct = {s.mapped_port for s in res.samples}
             if len(res.samples) >= 2:
                 detail = "；".join(str(s) for s in res.samples[:6])
@@ -565,6 +580,49 @@ class NatDetector:
         if not known:
             return None
         return min(known, key=lambda s: s.rtt_ms)
+
+    def _recheck_outlier_samples(self, sock, res: NatResult) -> None:
+        """对"映射端口与多数不一致"的单个离群样本，重发一次该目的。
+
+        重测后与多数一致 → 用新样本替换（说明原值是伪影）；
+        仍不一致 → 保留原样本，但记一条提示（此时才可能是真的 APDM）。
+
+        只在存在**多数端口**（≥2 个样本一致）且离群样本唯一时才动手，
+        正常 EIM 环境下一次额外的包都不会发。
+        """
+        if len(res.samples) < 3:
+            return
+        counts: dict[int, int] = {}
+        for s in res.samples:
+            counts[s.mapped_port] = counts.get(s.mapped_port, 0) + 1
+        top_port, top_count = max(counts.items(), key=lambda kv: kv[1])
+        if top_count < 2:
+            return
+        outliers = [s for s in res.samples if s.mapped_port != top_port]
+        if len(outliers) != 1 or counts[outliers[0].mapped_port] != 1:
+            return
+
+        target = outliers[0]
+        r = stun.binding_transaction(
+            sock, (target.dst_ip, target.dst_port), timeout=1.2
+        )
+        if r.ok and r.mapped and r.mapped[1] == top_port:
+            res.samples = [s for s in res.samples if s is not target]
+            res.samples.append(
+                MappingSample(
+                    target.dst_ip, target.dst_port, r.mapped[0], r.mapped[1], target.label
+                )
+            )
+            res.notes.append(
+                f"离群样本 {target.dst_ip}:{target.dst_port} 复核后与多数端口一致"
+                f"（{target.mapped_port} → {top_port}），原值计为测量伪影"
+            )
+            self.log(f"离群样本 {target.dst_ip}:{target.dst_port} 复核一致，已采用重测值")
+        else:
+            res.warnings.append(
+                f"{target.dst_ip}:{target.dst_port} 的映射端口 {target.mapped_port} "
+                f"与多数（{top_port}）不一致，复核后仍不一致，已保留"
+            )
 
     # ---- 阶段 2：行为测量（全新 socket，绝不预热） ----
 
@@ -658,22 +716,30 @@ class NatDetector:
             )
 
     def _change_request(self, sock, dst, change_ip: bool, change_port: bool, deadline: float):
-        """独立重试一次 CHANGE-REQUEST：最多 FILTER_ATTEMPTS 次，只对超时重试。"""
-        last = stun.BindingResult()
+        """独立重试一次 CHANGE-REQUEST：最多 FILTER_ATTEMPTS 次，只对超时重试。
+
+        ``deadline`` 是**软预算**：过了它就不再补发重试，但每个真正发出去的包
+        都按 ``FILTER_TIMEOUT_S`` 等满。绝不把 `min(timeout, remain)` 这种压缩写
+        进来——那会让"预算不够"伪装成"被 NAT 过滤"，方向性错误。
+        """
+        last: stun.BindingResult | None = None
         for attempt in range(FILTER_ATTEMPTS):
-            remain = deadline - time.perf_counter()
-            if remain <= 0.05:
-                break
+            if last is not None and time.perf_counter() > deadline:
+                break  # 软预算用完：不再重发，但已发的包都等满了
             last = stun.binding_transaction(
                 sock, dst,
                 change_ip=change_ip, change_port=change_port,
-                timeout=min(FILTER_TIMEOUT_S, remain),
+                timeout=FILTER_TIMEOUT_S,
                 attempts=1,  # 重试放在外层：每次都是新的 transaction id
             )
             if last.ok or last.error_kind != stun.ErrorKind.TIMEOUT.value:
                 break
             if attempt < FILTER_ATTEMPTS - 1:
                 time.sleep(FILTER_RETRY_GAP_S)
+        if last is None:  # 理论上不会发生（首包必定发出）
+            last = stun.BindingResult(
+                error="未执行：时间预算不足", error_kind=stun.ErrorKind.UNKNOWN.value
+            )
         return last
 
     # ---- 阶段 1：能力诊断（允许预热，只用于解释超时） ----

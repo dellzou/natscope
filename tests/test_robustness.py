@@ -706,6 +706,66 @@ class TestStunParserPolicy(unittest.TestCase):
         self.assertEqual(msg.other_address(), ("198.51.100.9", 3479))
 
 
+class TestMappingOutlierTolerance(unittest.TestCase):
+    """P1-18 回归：单个离群样本不得把 EIM 判成对称型。
+
+    场景：4 个样本映射端口一致，另 1 个目的因刚被 CHANGE-REQUEST 碰过而被 NAT
+    重新分配了端口（公网出口 IP 相同）。这是测量伪影，不是"映射随目的变化"。
+    """
+
+    @staticmethod
+    def _samples(outlier_port: int = 21699):
+        from natscope.nat import MappingSample
+
+        return [
+            MappingSample("198.51.100.1", 3478, "203.0.113.7", 50000, "a"),
+            MappingSample("198.51.100.2", 3478, "203.0.113.7", 50000, "b"),
+            MappingSample("198.51.100.3", 3478, "203.0.113.7", 50000, "c"),
+            MappingSample("198.51.100.4", 3478, "203.0.113.7", 50000, "d"),
+            MappingSample("198.51.100.5", 3479, "203.0.113.7", outlier_port, "e"),
+        ]
+
+    def test_single_outlier_is_still_eim(self):
+        from natscope.nat import MAP_EIM, _mapping_mode
+
+        self.assertEqual(_mapping_mode(self._samples()), MAP_EIM)
+
+    def test_majority_consistent_is_eim(self):
+        from natscope.nat import MAP_EIM, _mapping_mode
+
+        samples = self._samples()[:3]  # 3 一致
+        self.assertEqual(_mapping_mode(samples), MAP_EIM)
+
+    def test_true_symmetric_is_not_eim(self):
+        from natscope.nat import MAP_APDM, MappingSample, _mapping_mode
+
+        # 每个目的各持一个端口 → 没有多数 → 不可能是 EIM
+        samples = [
+            MappingSample("198.51.100.1", 3478, "203.0.113.7", 50001, "a"),
+            MappingSample("198.51.100.1", 3479, "203.0.113.7", 50002, "b"),
+            MappingSample("198.51.100.2", 3478, "203.0.113.7", 50003, "c"),
+        ]
+        self.assertEqual(_mapping_mode(samples), MAP_APDM)
+
+    def test_decide_not_symmetric_on_single_outlier(self):
+        from natscope.nat import (
+            CLASSIC_PORT_RESTRICTED,
+            FILT_APDF,
+            MAP_EIM,
+            _mapping_mode,
+        )
+
+        res = NatResult(
+            ok=True, local_ip="192.168.1.2", local_port=5000,
+            public_ip="203.0.113.7", public_port=50000,
+            mapping_behavior=_mapping_mode(self._samples()),
+            filtering_behavior=FILT_APDF,
+        )
+        NatDetector()._decide(res)
+        self.assertEqual(res.mapping_behavior, MAP_EIM)
+        self.assertEqual(res.classic_type, CLASSIC_PORT_RESTRICTED)
+
+
 def struct_pack_h(value: int) -> bytes:
     import struct
 
