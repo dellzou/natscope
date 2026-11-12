@@ -130,6 +130,7 @@ class App(tk.Tk):
         self._boot_ids: list[str] = [self.after(600, self._maybe_first_run)]
         self._drain_id = self.after(120, self._drain)
         self._dpi_id = self.after(1500, self._poll_dpi)
+        self._progress_id = ""
         if autostart:
             # 启动即自动开始一轮，省去一次点击
             self._boot_ids.append(self.after(400, self._start))
@@ -215,6 +216,11 @@ class App(tk.Tk):
         hairline(self, palette).pack(side="bottom", fill="x")
         bar = tk.Frame(self, bg=palette.surface)
         bar.pack(side="bottom", fill="x")
+        # 底栏**顶边**再来一条 1px 描边。底栏与卡片的 surface 同色，滚动内容
+        # （行为矩阵那一行）会从按钮正下方穿过去——没有这条线，看上去像"按钮
+        # 盖住了内容/渲染错位"。固定栏与滚动内容之间必须有视觉分隔。
+        # pack(side="bottom") 是按调用顺序自下而上堆叠，所以这条线在 bar 之上。
+        hairline(self, palette).pack(side="bottom", fill="x")
         row = tk.Frame(bar, bg=palette.surface)
         row.pack(fill="x", padx=pad, pady=px(self._scale, 9))
 
@@ -262,6 +268,9 @@ class App(tk.Tk):
         self._build_info(body)
         self._build_results(body)
         self._build_log(body)
+        # 滚动区底部留白：滚到底时最后一块卡片不贴底栏那条 1px 描边。
+        # 底色用 bg（比卡片 surface 略深），与底栏形成层次差。
+        tk.Frame(body, bg=palette.bg, height=px(self._scale, 10)).pack(fill="x")
 
     def _build_conclusion(self, body: tk.Frame) -> None:
         palette = self.palette
@@ -594,10 +603,24 @@ class App(tk.Tk):
         if hasattr(self, "btn_start"):
             self.btn_start.configure(text="开始检测", state="normal")
         self._progress(1.0)
+        # 进度条 100% 是通栏一条高亮，与底栏那条 1px 描边挤在一起会显得底栏
+        # 有两条边。短暂停留让用户看到"跑完了"，再收回去；状态行本来就写着
+        # 「检测完成 · 耗时 x.x s」。
+        try:
+            self._progress_id = self.after(1200, self._clear_progress)
+        except tk.TclError:
+            pass
         if self._dpi_pending is not None:
             pending = self._dpi_pending
             self._dpi_pending = None
             self._reflow(pending)
+
+    def _clear_progress(self) -> None:
+        """把已完成的进度条收回（新一轮检测已开始就保留）。"""
+        self._progress_id = ""
+        if self._closing or self._running:
+            return
+        self._progress(0.0)
 
     def _start(self) -> None:
         if self._running:
@@ -855,7 +878,11 @@ class App(tk.Tk):
 
     def _cancel_timers(self) -> None:
         """取消所有挂起的 ``after``（销毁前必须做，否则留一串 Tcl 报错）。"""
-        handles = [self._drain_id, self._dpi_id, *getattr(self, "_boot_ids", [])]
+        handles = [
+            self._drain_id, self._dpi_id,
+            getattr(self, "_progress_id", ""),
+            *getattr(self, "_boot_ids", []),
+        ]
         for handle in handles:
             if not handle:
                 continue
@@ -865,6 +892,7 @@ class App(tk.Tk):
                 pass
         self._drain_id = ""
         self._dpi_id = ""
+        self._progress_id = ""
         self._boot_ids = []
 
     def _on_close(self) -> None:
