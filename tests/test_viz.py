@@ -353,6 +353,39 @@ class TestNoteTruthfulness(unittest.TestCase):
                 )
 
 
+    def test_symmetric_with_unmeasured_filtering_is_explained(self):
+        """整行 related 的两种情形都必须有说明，不能一个有一个没有。
+
+        对称型 + mapping 实测 + filtering 不可测是**真机可达**的常见组合
+        （服务器都不支持 CHANGE-REQUEST 时），历史上 note 是空串：用户看到
+        ADM 行三格亮着，却没有任何一行字解释缺的是过滤行为。
+        """
+        for mapping in (MAP_ADM, MAP_APDM):
+            with self.subTest(mapping=mapping):
+                nat = NatResult(
+                    classic_type=CLASSIC_SYMMETRIC,
+                    mapping_behavior=mapping,
+                    filtering_behavior="unknown",
+                )
+                mat = viz.build_matrix(nat)
+                self.assertTrue(
+                    mat.note,
+                    "整行 related 却没有说明：用户会看到三格亮着、零线索；"
+                    "必须说清「已确定什么、还缺什么」",
+                )
+                self.assertIn(
+                    "映射行为已测得",
+                    mat.note,
+                    "结论已由映射行为确定，只缺过滤策略；"
+                    "只写「过滤不可测」会让用户以为整个结论都不可靠",
+                )
+                self.assertIn(
+                    "过滤行为不可测",
+                    mat.note,
+                    "必须指出缺的那一项是过滤行为，否则用户不知道该去补什么",
+                )
+
+
 class TestSpectrum(unittest.TestCase):
     def test_order_is_best_to_worst(self):
         segs = viz.build_spectrum(NatResult(classic_type=CLASSIC_FULL_CONE))

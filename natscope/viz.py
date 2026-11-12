@@ -394,13 +394,21 @@ def build_matrix(nat: NatResult) -> Matrix:
         note = "映射行为不可测（可用服务器不足），行为矩阵没有确定位置。"
     elif not filtering:
         # 映射已测、过滤不可测：整行 related 已经把「候选」画出来了，
-        # 锥型行再加一句，其余（对称型已细分）不需要额外说明。
+        # 但两种整行候选要分别交代——「已确定什么、还缺什么」。
         if mapping == MAP_EIM:
             # 措辞必须与类型谱的区间标签（spectrum_span().label）前半句逐字一致：
             # 同一张图里两套说法会被读成「两个不同的状态」。
             note = (
                 "锥型（三选一，无法细分）：过滤行为不可测，"
                 "无法确认是完全 / 受限 / 端口受限锥型。"
+            )
+        elif mapping_measured:
+            # 对称型已细分到 ADM / APDM：行是实测的，缺的是列。
+            # 空 note 会让用户看到三格亮着却零线索——「没有解释」比
+            # 「解释得不准确」更糟，后者至少给了一个可查的方向。
+            note = (
+                "对称型：映射行为已测得（ADM / APDM），过滤行为不可测，"
+                "无法进一步细分过滤策略。"
             )
     elif mapping_measured and filtering_measured:
         note = "映射与过滤行为均已测得，结论落在高亮格。"
