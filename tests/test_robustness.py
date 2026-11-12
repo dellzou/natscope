@@ -288,7 +288,7 @@ class TestFilteringArchitecture(unittest.TestCase):
         result = run_detector(fake, [make_probe(*PRIMARY), make_probe(*SECOND, rfc5780=False)])
         self.assertEqual(result.filtering_behavior, FILT_UNKNOWN)
         self.assertTrue(
-            any("无法区分" in w for w in result.warnings),
+            any("change_port 能力" in w or "无法区分" in w for w in result.warnings),
             f"降级时必须说明原因，实际 warnings={result.warnings}",
         )
 
@@ -768,6 +768,58 @@ class TestProbeBatchIsolation(unittest.TestCase):
         self.assertFalse(by_key["bad.test:3478"].ok)
         self.assertIn("探测异常", by_key["bad.test:3478"].error)
         self.assertTrue(by_key["good.test:3478"].ok, "正常服务器也必须被探测到")
+
+
+class TestNonRoutableOtherAddress(unittest.TestCase):
+    """OTHER/CHANGED 不可路由的服务器没资格当证明者/测量者。
+
+    实测：stun.freeswitch.org 的某些 DNS 实例把 OTHER-ADDRESS 报成
+    ``10.10.0.62:443``（另一实例报 143.198.60.79:443，是可用的）。预热打向私网
+    地址等于没预热，随后 change_port 必然"无响应"——若当成"服务器不实现"，
+    结论就被误降到 unknown，等于让一条 DNS 记录决定用户的 NAT 结论。
+    """
+
+    def test_private_other_makes_server_unqualified(self):
+        fake = FakeStunNetwork(PRIMARY, other=("10.10.0.62", 443), filter_mode="apdf")
+        result = run_detector(
+            fake, [make_probe(*PRIMARY), make_probe(*SECOND, rfc5780=False, rtt=30.0)]
+        )
+        self.assertEqual(result.filtering_behavior, FILT_UNKNOWN)
+        self.assertNotEqual(result.filtering_behavior, FILT_APDF)
+        self.assertTrue(
+            any("不可路由" in w or "无法验证" in w for w in result.warnings),
+            f"必须写明是「无法验证」而不是「服务器不实现」，warnings={result.warnings}",
+        )
+
+    def test_routable_other_still_proves(self):
+        # 对照组：同样的 NAT，但 OTHER 是公网地址 → 能自证 → APDF
+        fake = FakeStunNetwork(PRIMARY, other=OTHER, filter_mode="apdf")
+        result = run_detector(
+            fake, [make_probe(*PRIMARY), make_probe(*SECOND, rfc5780=False, rtt=30.0)]
+        )
+        self.assertEqual(result.filtering_behavior, FILT_APDF)
+
+
+class TestReportedServerMatchesMeasurer(unittest.TestCase):
+    """报告里“由哪台测得”必须与实际测量者一致，不许自相矛盾。"""
+
+    def test_reported_server_follows_the_switch(self):
+        # 主服务器不实现 change_port、第二台实现 → 换台重测后，报告名字也要跟着换
+        fake = PerServerCapabilityNetwork(
+            PRIMARY, other=OTHER, filter_mode="apdf", capable_dsts=[SECOND]
+        )
+        result = run_detector(
+            fake,
+            [make_probe(*PRIMARY, rtt=10.0), make_probe(*SECOND, rfc5780=True, rtt=30.0)],
+        )
+        self.assertEqual(result.filtering_behavior, FILT_APDF)
+        self.assertEqual(
+            result.rfc5780_server, "192.0.2.2:3478",
+            "结论由第二台测得，报告的 rfc5780_server 却仍是第一台",
+        )
+        credit = [n for n in result.notes if "自己正向证明" in n]
+        self.assertTrue(credit)
+        self.assertIn("192.0.2.2:3478", credit[0])
 
 
 def struct_pack_h(value: int) -> bytes:

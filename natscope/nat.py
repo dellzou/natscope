@@ -270,7 +270,12 @@ _NON_ROUTABLE_NETS = tuple(
 
 
 def _is_routable(ip: str) -> bool:
-    """该地址能否当作"公网采样目标"：排除私网 / 环回 / 链路本地 / CGNAT / 组播。"""
+    """该地址能否当作"公网采样目标/预热目标"：排除私网 / 环回 / 链路本地 / CGNAT / 组播。
+
+    **不要换成 ``ipaddress.is_private``**：Python 3.10+ 起它把 TEST-NET / 文档保留段
+    （192.0.2.0/24、198.51.100.0/24、203.0.113.0/24）也算作私有，会把单元测试夹具与
+    真实的边缘地址一起误杀。这里用显式网段白名单，语义就是"能不能真的发到公网去"。
+    """
     try:
         addr = ipaddress.ip_address(ip)
     except ValueError:
@@ -652,6 +657,8 @@ class NatDetector:
                 candidates.append(s)
 
         unproven: list[str] = []
+        unqualified: list[str] = []
+        unusable: list[str] = []
         for index, candidate in enumerate(candidates):
             first = index == 0
             dst = (candidate.ip, candidate.server.port)
@@ -685,35 +692,59 @@ class NatDetector:
                 and r3.error_kind == stun.ErrorKind.TIMEOUT.value
             )
             if not both_timeout:
-                res.filtering_behavior = FILT_UNKNOWN
-                res.warnings.append(
-                    f"{candidate.server.label} 的 CHANGE-REQUEST 未得到可用结论"
-                    f"（{r2.error_kind or '空'}/{r3.error_kind or '空'}），"
-                    "过滤行为标记为不可测"
+                # 不是"两个子测试都超时"——可能是这台服务器忽略 CHANGE-REQUEST
+                # （回包源地址没变），也可能是测量通道压根建不起来（该服务器此刻
+                # 不可达）。这两种都不是 NAT 过滤的证据，换下一台重测，而不是
+                # 直接给用户一个"不可测"。
+                unusable.append(
+                    f"{candidate.server.label}（{r2.error_kind or '无回包变化'}/"
+                    f"{r3.error_kind or '无回包变化'}）"
                 )
-                return
+                continue
 
             # 这台服务器自己测得"双超时"。到底是 NAT 在过滤，还是它自己不实现
             # change_port？只有**它自己**能回答这个问题——拿别人的能力证据给它
             # 背书，等于给用户的网络扣一顶莫须有的帽子。
-            proven, detail = self._probe_change_port_capability(candidate)
+            proven, viable, detail = self._probe_change_port_capability(candidate)
             res.notes.append(f"能力诊断 {candidate.server.label}：{detail}")
             self.log(f"能力诊断 {candidate.server.label}：{detail}")
             if proven:
                 res.filtering_behavior = FILT_APDF
+                # 报告里"由哪台服务器测得"必须与实际测量者一致，否则用户会看到
+                # 「rfc5780_server=A」却「结论由 B 背书」的自相矛盾。
+                res.rfc5780_server = candidate.server.label
                 res.notes.append(
                     f"change_port 能力由测量服务器 {candidate.server.label} 自己正向证明，"
                     "双超时 → APDF"
                 )
                 return
+            if not viable:
+                # 没资格当证明者（没宣告 OTHER，或宣告的是私网地址）——跳过换下一台，
+                # 不要给它下"不实现 change_port"的结论。
+                unqualified.append(f"{candidate.server.label}（{detail}）")
+                continue
             unproven.append(candidate.server.label)
 
         res.filtering_behavior = FILT_UNKNOWN
-        res.warnings.append(
-            "Change-IP 与 Change-Port 均超时，且没有任何一台测量服务器能**自己**证明会响应 "
-            f"change_port（已试 {len(unproven)} 台：{'、'.join(unproven)}）—— "
-            "无法区分『NAT 过滤』与『服务器不实现』，过滤行为仅能确定『比 EIF 更严』"
-        )
+        if unusable and not unproven and not unqualified:
+            res.warnings.append(
+                "候选服务器上都无法完成 CHANGE-REQUEST 测量"
+                f"（{'；'.join(unusable)}）——这批服务器要么忽略该属性、要么此刻不可达，"
+                "过滤行为标记为不可测"
+            )
+        elif unqualified and not unproven:
+            res.warnings.append(
+                "Change-IP 与 Change-Port 均超时，但候选服务器的 OTHER/CHANGED 地址都不可用于"
+                f"验证（{'；'.join(unqualified)}）——无法验证 change_port 能力，"
+                "过滤行为仅能确定『比 EIF 更严』"
+            )
+        else:
+            res.warnings.append(
+                "Change-IP 与 Change-Port 均超时，且没有任何一台测量服务器能**自己**证明会响应 "
+                f"change_port（已试 {len(unproven) + len(unqualified)} 台："
+                f"{'、'.join(unproven + unqualified)}）—— 无法区分『NAT 过滤』与"
+                "『服务器不实现』，过滤行为仅能确定『比 EIF 更严』"
+            )
 
     def _set_step(self, res: NatResult, name: str, status: str, detail: str) -> None:
         """按名字覆盖已有步骤，避免重测后报告里出现同名步骤一 √ 一 ×（P1-10）。"""
@@ -812,8 +843,18 @@ class NatDetector:
 
     # ---- 能力诊断（允许预热，只用于解释超时；证明者必须 = 测量者） ----
 
-    def _probe_change_port_capability(self, srv: ProbeResult) -> tuple[bool, str]:
-        """在一次性 socket 上验证服务器是否会响应 change_port。"""
+    def _probe_change_port_capability(self, srv: ProbeResult) -> tuple[bool, bool, str]:
+        """在一次性 socket 上验证服务器是否会响应 change_port。
+
+        返回 ``(proven, viable, detail)``：
+
+        * ``viable=False`` 表示**这台服务器根本没资格当证明者/测量者**——它没宣告
+          OTHER/CHANGED，或宣告的是私网/环回地址（实测 stun.freeswitch.org 某些
+          DNS 实例会给出 10.10.0.62:443）。这类地址预热是打空的，随后 change_port
+          必然"无响应"，若当成"服务器不实现"就会误降到 unknown。
+          正确做法是跳过这台、换下一台，而不是给它下结论。
+        * ``viable=True, proven=False`` 才是"有效候选但确实不实现 change_port"。
+        """
         dst = (srv.ip, srv.server.port)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
         try:
@@ -821,9 +862,14 @@ class NatDetector:
             base = stun.binding_transaction(sock, dst, timeout=FILTER_CAP_TIMEOUT_S)
             other = base.other if base.ok else None
             if not base.ok:
-                return False, f"普通 Binding 无响应（{base.error or '超时'}）"
+                return False, False, f"普通 Binding 无响应（{base.error or '超时'}）"
             if not other:
-                return False, "响应未带 OTHER-ADDRESS / CHANGED-ADDRESS"
+                return False, False, "响应未带 OTHER-ADDRESS / CHANGED-ADDRESS"
+            if not _is_routable(other[0]):
+                return False, False, (
+                    f"OTHER/CHANGED 是 {other[0]}:{other[1]}（私网/不可路由），"
+                    "预热打空，无法可靠验证能力"
+                )
             # 预热预期回包源：change_port 的回包来自 (dst_ip, other_port)，
             # 顺带把 other 的 IP 也放进白名单，覆盖 ADF / APDF 两种过滤策略
             stun.binding_transaction(sock, other, timeout=FILTER_CAP_TIMEOUT_S)
@@ -832,8 +878,8 @@ class NatDetector:
                 sock, dst, change_port=True, timeout=FILTER_CAP_TIMEOUT_S, attempts=2
             )
             if r.ok and r.source and r.source[1] != dst[1]:
-                return True, f"change_port 有响应（源 {r.source[0]}:{r.source[1]}）"
-            return False, f"change_port 无响应（{r.error or '超时'}）"
+                return True, True, f"change_port 有响应（源 {r.source[0]}:{r.source[1]}）"
+            return False, True, f"change_port 无响应（{r.error or '超时'}）"
         finally:
             sock.close()
 
