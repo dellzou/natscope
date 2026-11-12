@@ -436,6 +436,32 @@ class TestErrorKind(unittest.TestCase):
         self.assertTrue(all(a >= 2 for a in seen), f"单包重试缺失：attempts={seen}")
 
 
+class TestStepBookkeeping(unittest.TestCase):
+    """P1-10 回归：Test I 重试成功后不得留下状态互相矛盾的重复步骤。"""
+
+    def test_single_test_one_step_after_failover(self):
+        class PrimaryDown(SimulatedNat):
+            def __call__(self, sock, dest, change_ip=False, change_port=False,
+                         timeout=1.5, attempts=1):
+                if not change_ip and not change_port and dest[0] == PRIMARY_IP:
+                    return stun.BindingResult(
+                        ok=False, error="timeout", error_kind=stun.ERR_TIMEOUT
+                    )
+                return super().__call__(sock, dest, change_ip, change_port, timeout, attempts)
+
+        fake = PrimaryDown()
+        with mock.patch.object(stun, "binding_transaction", fake), mock.patch.object(
+            nat, "local_outbound_ip", lambda: ("192.168.1.10", 0)
+        ):
+            result = NatDetector(timeout=0.2).run(make_servers())
+
+        self.assertEqual(result.primary_server, "stun-b.test:3478", "未切换到备选服务器")
+        steps = [s for s in result.steps if s.name == "Test I：获取映射地址"]
+        self.assertEqual(len(steps), 1, f"Test I 出现 {len(steps)} 条步骤：{steps}")
+        self.assertEqual(steps[0].status, "ok")
+        self.assertIn("已改用", steps[0].detail)
+
+
 def struct_pack_h(value: int) -> bytes:
     import struct
 

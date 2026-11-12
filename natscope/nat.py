@@ -260,6 +260,13 @@ def _mapping_mode(samples: list[MappingSample]) -> str:
 
 
 def _classic_from_behavior(mapping: str, filtering: str) -> str:
+    """行为模型 → 传统四类型的**纯**映射（无副作用）。
+
+    注意：生产路径走 ``NatDetector._decide()``，它会先判对称型、再判"无 NAT"、
+    最后才套行为映射；本函数不处理"无 NAT"这类前置条件，两者在 open 场景下
+    结论不同。保留它是因为单元测试需要一份无副作用、可穷举的映射表，改动前
+    请先看 ``_decide()``。
+    """
     if mapping in (MAP_ADM, MAP_APDM):
         return CLASSIC_SYMMETRIC
     if mapping == MAP_EIM:
@@ -320,42 +327,44 @@ class NatDetector:
 
             # ---------- Test I ----------
             r1 = self._binding(sock, primary, 1.0)
+            switched_from = ""
             if not r1.ok or not r1.mapped:
-                res.add_step("Test I：获取映射地址", "fail", r1.error or "无响应")
                 res.error = f"主服务器 {primary.server.label} 无有效响应：{r1.error or '超时'}"
                 # 换一个服务器再试一次
                 for alt in usable[1:4]:
                     r1 = self._binding(sock, alt, 1.2)
                     if r1.ok and r1.mapped:
+                        switched_from = primary.server.label
                         primary = alt
                         res.primary_server = alt.server.label
                         break
                 if not (r1.ok and r1.mapped):
                     res.classic_type = CLASSIC_BLOCKED
-                    res.add_step("Test I：重试备选服务器", "fail", "全部无响应")
+                    res.add_step("Test I：获取映射地址", "fail", "主服务器与备选服务器全部无响应")
                     res.duration_ms = (time.perf_counter() - t_start) * 1000
                     return res
-                res.add_step("Test I：获取映射地址", "ok", f"改用 {primary.server.label}")
 
             mapped = r1.mapped
             res.public_ip, res.public_port = mapped
             self.log(f"Test I 通过，公网映射 {mapped[0]}:{mapped[1]}（{r1.rtt_ms:.0f} ms）")
 
+            # 无论是否中途换过服务器，Test I 只写一条步骤：同一步骤同时出现
+            # × 和 √ 会让报告里的结论无从判断（审计 P1-10）。
+            detail = f"{mapped[0]}:{mapped[1]}（本地 {local_ip}:{local_port}）"
+            if switched_from:
+                detail += f"；主服务器 {switched_from} 超时，已改用 {primary.server.label}"
+            res.add_step("Test I：获取映射地址", "ok", detail)
+
             if mapped[0] == local_ip and mapped[1] == local_port:
                 res.classic_type = CLASSIC_OPEN
                 res.mapping_behavior = MAP_EIM
                 res.filtering_behavior = FILT_UNKNOWN
-                res.add_step("Test I：获取映射地址", "ok", "映射地址与本地一致 → 无 NAT")
+                res.add_step("判定：无 NAT", "ok", "映射地址与本地一致")
                 res.ok = True
                 res.duration_ms = (time.perf_counter() - t_start) * 1000
                 self.log("映射地址与本地一致，判定为开放互联网")
                 return res
 
-            res.add_step(
-                "Test I：获取映射地址",
-                "ok",
-                f"{mapped[0]}:{mapped[1]}（本地 {local_ip}:{local_port}）",
-            )
             res.samples.append(MappingSample(primary.ip, primary.server.port,
                                              mapped[0], mapped[1], primary.server.label))
 
@@ -418,7 +427,9 @@ class NatDetector:
             distinct = {s.mapped_port for s in res.samples}
             if len(res.samples) >= 2:
                 detail = "；".join(str(s) for s in res.samples[:6])
-                status = "ok" if len(distinct) == 1 else "ok"
+                # 端口不一致本身是"对称型"的信号，不该和成功一样打 √；
+                # "warn" 在两个渲染器里都落到中性色 + "·"，不会误报成失败。
+                status = "ok" if len(distinct) == 1 else "warn"
                 res.add_step(
                     "多目标映射采样",
                     status,
@@ -485,9 +496,9 @@ class NatDetector:
 
         for s in sorted(usable, key=lambda x: x.rtt_ms)[:5]:
             r = self._binding(sock, s, 1.0)
+            # 420（Unknown Attribute）等错误应答在 binding_transaction 里都是
+            # ok=False，已由下面这一行统一跳过，不需要单独判 error_code
             if not r.ok:
-                continue
-            if r.message and r.message.error_code == 420:
                 continue
             if r.other:
                 return s
