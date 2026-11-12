@@ -174,7 +174,13 @@ def build_binding_request(
 
 
 def parse_message(data: bytes) -> StunMessage:
-    """解析 STUN 报文；非 STUN 数据抛 StunError。"""
+    """解析 STUN 报文；非 STUN 数据或长度自相矛盾时抛 StunError。
+
+    严格性的理由：UDP 不会把被截断的数据报交给应用层（截断数据报会被内核
+    直接丢弃），所以"收到的包比它自己声明的短"只可能是对端造错、或是伪造/
+    混淆包。旧实现遇到这种情况会静默 break，把残缺报文当成合法报文返回，
+    于是故障表现为"这台服务器没响应"，排查时完全看不出是报文坏了。
+    """
     if len(data) < 20:
         raise StunError("报文过短")
     msg_type, length, cookie = struct.unpack("!HHI", data[:8])
@@ -182,15 +188,19 @@ def parse_message(data: bytes) -> StunMessage:
         raise StunError("magic cookie 不匹配，非 RFC 5389 报文")
     if msg_type & 0xC000:
         raise StunError("type 高两位必须为 0")
-    tid = data[8:20]
     body = data[20 : 20 + length]
+    if len(body) < length:
+        raise StunError(f"报文被截断：声明 {length} 字节，实际只有 {len(body)} 字节")
+    tid = data[8:20]
     attrs: dict[int, bytes] = {}
     off = 0
     while off + 4 <= len(body):
         atype, alen = struct.unpack("!HH", body[off : off + 4])
         off += 4
         if off + alen > len(body):
-            break
+            raise StunError(
+                f"属性 0x{atype:04X} 越界：声明 {alen} 字节，剩余仅 {len(body) - off} 字节"
+            )
         attrs[atype] = body[off : off + alen]
         off += (alen + 3) & ~3
     return StunMessage(msg_type=msg_type, transaction_id=tid, attrs=attrs, raw=data)
@@ -216,15 +226,47 @@ class BindingResult:
         return bool(self.message and self.message.supports_change_request())
 
 
+def _is_ipv6_literal(host: str) -> bool:
+    """判断主机串是否是 IPv6 字面量（含 ``[::1]`` 形式，不含主机名）。"""
+    candidate = host.strip().strip("[]")
+    if ":" not in candidate:
+        return False
+    try:
+        socket.inet_pton(socket.AF_INET6, candidate)
+        return True
+    except (OSError, ValueError):
+        return False
+
+
 def resolve(host: str, port: int) -> tuple[str, int]:
-    """解析主机名，优先 IPv4。失败抛 OSError。"""
+    """解析主机名，**只返回 IPv4**。失败抛 OSError。
+
+    本工具全程复用同一个 IPv4 UDP socket（映射行为检测的前提），因此暂时
+    不支持 IPv6 服务器。旧实现把这种情况报成"DNS 解析失败"，会把用户引到
+    "换个 DNS"的错误方向；这里区分开：IPv6 字面量给出明确的"暂不支持"。
+    """
+    if _is_ipv6_literal(host):
+        raise OSError(f"暂不支持 IPv6 STUN 服务器：{host}（当前仅支持 IPv4）")
     try:
         infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
     except socket.gaierror as exc:
+        if _has_ipv6_address(host):
+            raise OSError(
+                f"{host} 只有 IPv6 地址（AAAA），当前仅支持 IPv4 STUN 服务器"
+            ) from exc
         raise OSError(f"DNS 解析失败: {host}") from exc
     if not infos:
         raise OSError(f"DNS 解析无结果: {host}")
     return infos[0][4][0], infos[0][4][1]
+
+
+def _has_ipv6_address(host: str) -> bool:
+    """A 记录查不到时，判断该主机是否只是"有 AAAA 没有 A"。"""
+    try:
+        infos = socket.getaddrinfo(host, 0, socket.AF_INET6, socket.SOCK_DGRAM)
+    except (socket.gaierror, OSError, UnicodeError):
+        return False
+    return bool(infos)
 
 
 def binding_transaction(

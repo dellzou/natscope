@@ -10,6 +10,9 @@
   * 所有测试复用同一个本地 UDP socket，否则映射端口不可比。
   * CHANGE-REQUEST 必须校验**回包源地址是否真的变了**。大量公共 STUN 服务器会
     忽略该属性、仍从原地址回包，若不校验会把"端口受限"误判成"完全锥型"。
+  * **CHANGE-REQUEST 必须排在一切"朝 OTHER-ADDRESS 发包"的动作之前**。先发过
+    包 = NAT 里已经有了该 ip:port 的入站许可，Test II 的回包就会被放行，于是
+    不放行陌生地址的 NAT 被自己的预热行为测成"完全锥型"。顺序见 run() 内注释。
   * 对称型必须优先判定（换目的 IP 后映射端口变），不能先套锥型判据。
 """
 
@@ -356,6 +359,34 @@ class NatDetector:
             res.samples.append(MappingSample(primary.ip, primary.server.port,
                                              mapped[0], mapped[1], primary.server.label))
 
+            # ---------- CHANGE-REQUEST：过滤行为 + Test II / III ----------
+            #
+            # 【顺序不能动】这段必须排在**任何向 OTHER-ADDRESS 发包的代码之前**。
+            #
+            # Test II 的判据是"回包源 IP 是否变成了另一个地址"，而服务器换源
+            # 地址后发来的那个地址，正是它 OTHER-ADDRESS 里宣告的地址。只要我
+            # 们事先朝那个 ip:port 发过哪怕一个 UDP 包，NAT 就会为它建好入站
+            # 许可（地址受限 / 端口受限型 NAT 都会），于是 Test II 的回包被放行，
+            # 判成 FILT_EIF → 报"完全锥型 / P2P 最佳"。这是一个会给出错误结论
+            # 的 bug：明明不放行陌生地址的 NAT，被自己的预热行为测成了全锥。
+            # 真机对照（stun.miwifi.com，各 5 次）：全新 socket 直接发 Change-IP
+            # 5/5 超时；先向 OTHER-ADDRESS 发一个包再发同一请求 5/5 成功。
+            # 所以多目标映射采样（_other_address_probes 与随后的采样循环）只能
+            # 排在这段之后 —— 采样本身必然要朝目标发包，那是测量映射行为必需的，
+            # 但它不能再"替"过滤测试把门打开。
+            cr_server = self._pick_change_request_server(sock, usable, res)
+            if cr_server is None:
+                res.add_step("Test II：Change IP+Port", "skip", "无服务器支持 CHANGE-REQUEST")
+                res.add_step("Test III：Change Port", "skip", "无服务器支持 CHANGE-REQUEST")
+                res.filtering_behavior = FILT_UNKNOWN
+                res.warnings.append(
+                    "当前可用服务器均未响应 CHANGE-REQUEST，过滤行为与传统四类型无法直接测量"
+                )
+            else:
+                res.change_request_supported = True
+                res.rfc5780_server = cr_server.server.label
+                self._filter_tests(sock, cr_server, res)
+
             # ---------- 多服务器映射采样（对称型 / 映射行为） ----------
             others = [s for s in usable[1:] if s.ip != primary.ip][: max_samples - 1]
             # OTHER-ADDRESS 可能是同 IP 不同端口，用于分离"改端口"与"改 IP"
@@ -399,20 +430,6 @@ class NatDetector:
                 res.warnings.append("不同 IP 的可用 STUN 服务器不足 2 个，映射行为结论可能不准确")
 
             res.mapping_behavior = _mapping_mode(res.samples)
-
-            # ---------- CHANGE-REQUEST：过滤行为 + Test II / III ----------
-            cr_server = self._pick_change_request_server(sock, usable, res)
-            if cr_server is None:
-                res.add_step("Test II：Change IP+Port", "skip", "无服务器支持 CHANGE-REQUEST")
-                res.add_step("Test III：Change Port", "skip", "无服务器支持 CHANGE-REQUEST")
-                res.filtering_behavior = FILT_UNKNOWN
-                res.warnings.append(
-                    "当前可用服务器均未响应 CHANGE-REQUEST，过滤行为与传统四类型无法直接测量"
-                )
-            else:
-                res.change_request_supported = True
-                res.rfc5780_server = cr_server.server.label
-                self._filter_tests(sock, cr_server, res)
 
             # ---------- 综合判定 ----------
             self._decide(res)

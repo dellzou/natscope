@@ -197,15 +197,38 @@ def _ssdp_discover(timeout: float = UPNP_TIMEOUT) -> list[str]:
     return locations
 
 
-def _fetch(url: str, timeout: float = UPNP_TIMEOUT) -> str:
-    parsed = urllib.parse.urlparse(url)
-    if parsed.scheme not in ("http", ""):
-        raise OSError("不支持的协议")
-    host = parsed.hostname or ""
-    port = parsed.port or 80
+def _split_url(url: str) -> tuple[str, str, int, str]:
+    """把 URL 拆成 ``(scheme, host, port, path?query)``，非法输入一律转成 OSError。
+
+    ``urllib.parse.urlparse(...).port`` 在端口非数字、超出 1..65535、或 IPv6
+    字面量括号不成对时抛的是 **ValueError 而不是 OSError**。SSDP 的 LOCATION
+    与设备描述里的 controlURL 全都来自局域网广播、属于完全不可信输入，而
+    ``probe_upnp`` 的 except 只接 OSError / HTTPException——ValueError 会一路
+    穿透到 ``probe_gateway`` 的 ``future.result()``，把已经算好的整份检测结果
+    带走。所以在唯一的入口处就把 ValueError 归一成 OSError。
+    """
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or ""
+        raw_port = parsed.port
+    except ValueError as exc:
+        raise OSError(f"URL 非法（{url}）：{exc}") from exc
+    # 注意不能用 ``parsed.port or 80``：端口 0 是 falsy，会被静默当成 80
+    port = 80 if raw_port is None else raw_port
+    if not host:
+        raise OSError(f"URL 缺少主机名：{url}")
+    if not 1 <= port <= 65535:
+        raise OSError(f"URL 端口越界：{port}")
     path = parsed.path or "/"
     if parsed.query:
         path += "?" + parsed.query
+    return parsed.scheme, host, port, path
+
+
+def _fetch(url: str, timeout: float = UPNP_TIMEOUT) -> str:
+    scheme, host, port, path = _split_url(url)
+    if scheme not in ("http", ""):
+        raise OSError(f"不支持的协议：{scheme}")
     conn = http.client.HTTPConnection(host, port, timeout=timeout)
     try:
         conn.request("GET", path, headers={"User-Agent": "NatScope/1.0"})
@@ -239,13 +262,17 @@ def _find_control_url(xml_text: str, base_url: str) -> tuple[str, str] | None:
         if "WANIPConnection" in stype or "WANPPPConnection" in stype:
             if ctrl.startswith("http"):
                 return stype, ctrl
-            return stype, urllib.parse.urljoin(base, ctrl)
+            try:
+                return stype, urllib.parse.urljoin(base, ctrl)
+            except ValueError:
+                # controlURL 是设备给的，格式再烂也只能跳过，不能让异常上抛
+                continue
     return None
 
 
 def _soap_get_external_ip(control_url: str, service_type: str) -> tuple[bool, str, str]:
     """调用 GetExternalIPAddress，返回 (成功, 外网 IP, 说明)。"""
-    parsed = urllib.parse.urlparse(control_url)
+    _, host, port, path = _split_url(control_url)
     body = (
         '<?xml version="1.0"?>'
         '<s:Envelope xmlns:s="http://schemas.xmlsoap.org/soap/envelope/" '
@@ -259,10 +286,7 @@ def _soap_get_external_ip(control_url: str, service_type: str) -> tuple[bool, st
         "SOAPAction": f'"{service_type}#GetExternalIPAddress"',
         "User-Agent": "NatScope/1.0",
     }
-    path = parsed.path or "/"
-    if parsed.query:
-        path += "?" + parsed.query
-    conn = http.client.HTTPConnection(parsed.hostname or "", parsed.port or 80, timeout=UPNP_TIMEOUT)
+    conn = http.client.HTTPConnection(host, port, timeout=UPNP_TIMEOUT)
     try:
         conn.request("POST", path, body=body.encode("utf-8"), headers=headers)
         resp = conn.getresponse()
@@ -289,7 +313,7 @@ def probe_upnp(gateway_ip: str, timeout: float = UPNP_TIMEOUT) -> Capability:
     for loc in locations[:3]:
         try:
             desc = _fetch(loc, timeout)
-        except (OSError, http.client.HTTPException) as exc:
+        except (OSError, ValueError, http.client.HTTPException) as exc:
             cap.state = "limited"
             cap.detail = f"发现设备但读取描述失败：{exc}"
             continue
@@ -300,7 +324,7 @@ def probe_upnp(gateway_ip: str, timeout: float = UPNP_TIMEOUT) -> Capability:
         cap.version = "WANIPConnection" if "WANIPConnection" in service_type else "WANPPPConnection"
         try:
             ok, ip, msg = _soap_get_external_ip(control_url, service_type)
-        except (OSError, http.client.HTTPException) as exc:
+        except (OSError, ValueError, http.client.HTTPException) as exc:
             cap.state = "limited"
             cap.detail = f"发现 IGD 但 SOAP 调用失败：{exc}"
             continue
@@ -431,8 +455,22 @@ def probe_pcp(gateway_ip: str, timeout: float = 1.5) -> Capability:
     return cap
 
 
+def _failed(name: str, exc: BaseException) -> Capability:
+    """把任何探测异常收敛成一个"存在但受限"的能力项。"""
+    cap = Capability(name)
+    cap.state = "limited"
+    cap.detail = f"探测异常：{type(exc).__name__}: {exc}"
+    return cap
+
+
 def probe_gateway(local_ip: str = "", timeout: float = 1.5) -> GatewayReport:
-    """三类探测并发执行，总耗时约等于最慢的一项（~2 s）。"""
+    """三类探测并发执行，总耗时约等于最慢的一项（~2 s）。
+
+    本函数**不该把任何异常抛给调用方**：网关探测只是报告的附加信息，一旦
+    抛异常，CLI 会 traceback 退出、GUI 会把已经算完的 NAT 结论整体丢弃，
+    用户看到的是"检测过程出现异常"而不是"网关能力未知"。因此每个并发
+    future 都在这里单独兜底。
+    """
     from concurrent.futures import ThreadPoolExecutor
 
     rep = GatewayReport()
@@ -444,18 +482,29 @@ def probe_gateway(local_ip: str = "", timeout: float = 1.5) -> GatewayReport:
     rep.gateway_ip = gw
     if not gw:
         rep.notes.append("未能获取默认网关地址，仅尝试 UPnP 组播发现")
-        rep.upnp = probe_upnp("", timeout=UPNP_TIMEOUT)
+        try:
+            rep.upnp = probe_upnp("", timeout=UPNP_TIMEOUT)
+        except Exception as exc:  # noqa: BLE001 - 单点故障不得拖垮整份报告
+            rep.upnp = _failed("UPnP-IGD", exc)
         rep.natpmp.state = "absent"
+        rep.natpmp.detail = "未获取到默认网关"
         rep.pcp.state = "absent"
+        rep.pcp.detail = "未获取到默认网关"
         return rep
+
+    def _settle(future, name: str) -> Capability:
+        try:
+            return future.result()
+        except Exception as exc:  # noqa: BLE001 - 单点故障不得拖垮整份报告
+            return _failed(name, exc)
 
     with ThreadPoolExecutor(max_workers=3) as pool:
         f_upnp = pool.submit(probe_upnp, gw, UPNP_TIMEOUT)
         f_pmp = pool.submit(probe_natpmp, gw, min(timeout, 1.5))
         f_pcp = pool.submit(probe_pcp, gw, min(timeout, 1.5))
-        rep.upnp = f_upnp.result()
-        rep.natpmp = f_pmp.result()
-        rep.pcp = f_pcp.result()
+        rep.upnp = _settle(f_upnp, "UPnP-IGD")
+        rep.natpmp = _settle(f_pmp, "NAT-PMP")
+        rep.pcp = _settle(f_pcp, "PCP")
 
     if not rep.any_available and rep.upnp.state == "absent":
         rep.notes.append(f"网关 {gw} 未响应 UPnP / NAT-PMP / PCP")
