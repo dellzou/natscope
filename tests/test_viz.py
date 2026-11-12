@@ -39,6 +39,7 @@ from natscope.nat import (
     MAP_ADM,
     MAP_APDM,
     MAP_EIM,
+    MAP_UNKNOWN,
     MappingSample,
     NatResult,
 )
@@ -214,6 +215,73 @@ class TestMatrixStructure(unittest.TestCase):
             for cell in line:
                 self.assertEqual(cell.state, viz.STATE_DIM)
         self.assertTrue(mat.note)
+
+
+class TestNoteTruthfulness(unittest.TestCase):
+    """``Matrix.note`` 是一句**陈述句**，不能比数据知道得更多。
+
+    背景：``build_matrix`` 里的 mapping / filtering 可能是从 ``classic_type``
+    反推来的。旧实现只要「解析后有值」就写「映射与过滤行为均已测得」，而
+    P0-2 兜底分支（单台可用 STUN + CHANGE-REQUEST 可用）恰好就是
+    「classic 有值、mapping 仍是 unknown」——于是同一份报告里，矩阵下方写着
+    「均已测得」，页脚警告却写着「映射行为未能测量」。假话在最显眼的位置，
+    真话被埋在页脚。
+    """
+
+    def test_p0_2_fallback_note_is_truthful(self):
+        """真机可达：``_decide()`` 兜底分支产出的组合。"""
+        nat = NatResult(
+            classic_type=CLASSIC_FULL_CONE,
+            mapping_behavior=MAP_UNKNOWN,
+            filtering_behavior=FILT_EIF,
+        )
+        note = viz.build_matrix(nat).note
+        self.assertIn("映射行为未测得", note)
+        self.assertIn("反推", note)
+        self.assertNotIn("均已测得", note)
+        # 反推链是 classic_type -> mapping，不是 filtering -> mapping，
+        # 文案必须指向真实存在的那条路径
+        self.assertIn("传统类型", note)
+        # 列（过滤行为）是实测的，必须让用户知道该信哪一维
+        self.assertIn("列由实测", note)
+
+    def test_note_never_claims_measured_for_inferred_behaviour(self):
+        cases = {
+            "两个字段都靠反推": NatResult(classic_type=CLASSIC_PORT_RESTRICTED),
+            "只有 mapping 靠反推（P0-2）": NatResult(
+                classic_type=CLASSIC_FULL_CONE,
+                mapping_behavior=MAP_UNKNOWN,
+                filtering_behavior=FILT_EIF,
+            ),
+            "只有 filtering 靠反推": NatResult(
+                classic_type=CLASSIC_FULL_CONE, mapping_behavior=MAP_EIM
+            ),
+        }
+        for label, nat in cases.items():
+            with self.subTest(label):
+                note = viz.build_matrix(nat).note
+                self.assertNotIn("均已测得", note, f"{label}：note 不许说「均已测得」")
+                self.assertIn("反推", note, f"{label}：必须说明是反推来的")
+
+    def test_fully_measured_note_still_says_measured(self):
+        """别为了修假话把真话也改掉（过度收紧同样是失真）。"""
+        nat = NatResult(
+            classic_type=CLASSIC_FULL_CONE,
+            mapping_behavior=MAP_EIM,
+            filtering_behavior=FILT_EIF,
+        )
+        self.assertIn("均已测得", viz.build_matrix(nat).note)
+
+    def test_note_has_no_status_marker(self):
+        """状态标记（「·反推」）归行头，正文只负责说明——避免两处都标反推。"""
+        nat = NatResult(
+            classic_type=CLASSIC_FULL_CONE,
+            mapping_behavior=MAP_UNKNOWN,
+            filtering_behavior=FILT_EIF,
+        )
+        note = viz.build_matrix(nat).note
+        self.assertNotIn("（反推）", note)
+        self.assertNotIn("·反推", note)
 
 
 class TestSpectrum(unittest.TestCase):

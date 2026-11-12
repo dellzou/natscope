@@ -372,8 +372,26 @@ def build_matrix(nat: NatResult) -> Matrix:
             line.append(make(row, col, state))
         grid.append(tuple(line))
 
+    # note 里的「均已测得」只能基于**实测字段**判断。viz 的 mapping / filtering
+    # 可能是从 classic_type 反推来的（_MAPPING_FROM_CLASSIC / _FILTERING_FROM_CLASSIC），
+    # 拿反推值说"已测得"就是在陈述一句不成立的事实——而且它会和同一份报告页脚的
+    # 警告（"映射行为未能测量"）直接打架：假话在图下方，真话被埋在页脚。
+    #
+    # 反推链是 classic_type → mapping/filtering（两跳里的第二跳），
+    # 不存在"从 filtering 直接推 mapping"的路径，所以文案写「由传统类型反推」。
+    # 状态标记（如行头的「·反推」）留给渲染层，正文只负责把事实说清楚。
+    mapping_measured = nat.mapping_behavior in _MAPPINGS
+    filtering_measured = nat.filtering_behavior in _FILTERINGS
     if rows and filtering:
-        note = "映射与过滤行为均已测得，结论落在高亮格。"
+        if mapping_measured and filtering_measured:
+            note = "映射与过滤行为均已测得，结论落在高亮格。"
+        elif filtering_measured:
+            # P0-2 兜底分支：classic 由过滤行为推出，mapping 仍是 unknown（真机可达）
+            note = "映射行为未测得，矩阵行由传统类型反推，列由实测过滤行为确定。"
+        elif mapping_measured:
+            note = "过滤行为未测得，矩阵列由传统类型反推，行由实测映射行为确定。"
+        else:
+            note = "映射与过滤行为均未测得，矩阵由传统类型反推定位。"
     elif mapping == MAP_EIM:
         # 措辞必须与类型谱的区间标签（spectrum_span().label）前半句逐字一致：
         # 同一张图里两套说法会被读成「两个不同的状态」。
