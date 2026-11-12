@@ -187,6 +187,37 @@ class TestClassicMapping(unittest.TestCase):
         self.assertEqual(_classic_from_behavior(MAP_ADM, "unknown"), CLASSIC_SYMMETRIC)
 
 
+class TestDecide(unittest.TestCase):
+    """_decide 的分支覆盖——这是绝大多数公共 STUN 环境实际会走到的路径。"""
+
+    def _decide(self, mapping, filtering, public=(("203.0.113.1"), 1234), local=("192.168.1.2", 1234)):
+        from natscope.nat import NatDetector, NatResult
+
+        r = NatResult(ok=True, local_ip=local[0], local_port=local[1],
+                      public_ip=public[0], public_port=public[1],
+                      mapping_behavior=mapping, filtering_behavior=filtering)
+        NatDetector()._decide(r)
+        return r
+
+    def test_cone_unknown_when_filtering_unmeasurable(self):
+        r = self._decide(MAP_EIM, "unknown")
+        self.assertEqual(r.classic_type, CLASSIC_CONE_UNKNOWN)
+
+    def test_full_cone(self):
+        self.assertEqual(self._decide(MAP_EIM, FILT_EIF).classic_type, CLASSIC_FULL_CONE)
+
+    def test_port_restricted(self):
+        self.assertEqual(self._decide(MAP_EIM, "apdf").classic_type, CLASSIC_PORT_RESTRICTED)
+
+    def test_symmetric_wins_over_filtering(self):
+        # 映射端口已随目的变化时，即使过滤行为测出 EIF 也必须判对称型
+        self.assertEqual(self._decide(MAP_APDM, FILT_EIF).classic_type, CLASSIC_SYMMETRIC)
+
+    def test_open_internet(self):
+        r = self._decide(MAP_EIM, "unknown", public=("192.168.1.2", 1234), local=("192.168.1.2", 1234))
+        self.assertEqual(r.classic_type, "open")
+
+
 class TestReport(unittest.TestCase):
     def test_text_report_builds(self):
         from natscope.nat import NatResult
