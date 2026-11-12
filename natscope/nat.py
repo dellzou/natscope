@@ -494,12 +494,19 @@ class NatDetector:
         return None
 
     def _filter_tests(self, sock, srv: ProbeResult, res: NatResult) -> None:
-        """Test II / III：校验回包源地址确实改变，否则该测试无效。"""
+        """Test II / III：校验回包源地址确实改变，否则该测试无效。
+
+        attempts=2：这两个测试此前是"裸发"的（服务器探测阶段反而有重试），
+        一次 UDP 丢包就会把结论降级一级（Full Cone → Restricted → Port
+        Restricted），误判方向还是"把好结果说成差结果"。重试一次即可覆盖
+        绝大多数偶发丢包，最坏耗时 2×1.2s/项。
+        """
         dst_ip, dst_port = srv.ip, srv.server.port
 
         # Test II：change IP + change Port
         r2 = stun.binding_transaction(
-            sock, (dst_ip, dst_port), change_ip=True, change_port=True, timeout=1.5
+            sock, (dst_ip, dst_port), change_ip=True, change_port=True,
+            timeout=1.2, attempts=2,
         )
         ii_valid = r2.ok and r2.source is not None and r2.source[0] != dst_ip
         if r2.ok and not ii_valid:
@@ -516,7 +523,8 @@ class NatDetector:
 
         # Test III：只改端口
         r3 = stun.binding_transaction(
-            sock, (dst_ip, dst_port), change_ip=False, change_port=True, timeout=1.5
+            sock, (dst_ip, dst_port), change_ip=False, change_port=True,
+            timeout=1.2, attempts=2,
         )
         iii_valid = r3.ok and r3.source is not None and r3.source[1] != dst_port
         if r3.ok and not iii_valid:
@@ -535,7 +543,8 @@ class NatDetector:
             res.filtering_behavior = FILT_EIF
         elif iii_valid:
             res.filtering_behavior = FILT_ADF
-        elif r2.error == "timeout" and r3.error == "timeout":
+        elif r2.error_kind == stun.ERR_TIMEOUT and r3.error_kind == stun.ERR_TIMEOUT:
+            # 只认结构化类别，不比对 error 的措辞（措辞一变这里就永久失效）
             res.filtering_behavior = FILT_APDF
         else:
             res.filtering_behavior = FILT_UNKNOWN
@@ -580,6 +589,32 @@ class NatDetector:
                     "已确认端点无关映射（EIM），但过滤行为不可测，"
                     "只能确定是锥型（完全/受限/端口受限之一）"
                 )
+            return
+
+        # 3) 映射行为测不出来（可用服务器不足），但过滤行为已有结论：
+        #    RFC 3489 的经典判据本来就是「Test I + Test II/III」，并不依赖多服务器
+        #    映射比对。旧实现只在 map_b == EIM 时才使用 filtering_behavior，于是
+        #    "Test II/III 明明都测出了结果，结论却是无法判定"，而 summary 文案还
+        #    写着"仅能给出映射行为"——与事实自相矛盾。触发条件很普通：企业网 /
+        #    严格防火墙只放行 1~2 台 STUN 服务器。
+        #    这里回退到经典三分类，并把前提明确写进警告。
+        if map_b == MAP_UNKNOWN and filt_b in (FILT_EIF, FILT_ADF, FILT_APDF):
+            classic = {
+                FILT_EIF: CLASSIC_FULL_CONE,
+                FILT_ADF: CLASSIC_RESTRICTED,
+                FILT_APDF: CLASSIC_PORT_RESTRICTED,
+            }[filt_b]
+            res.classic_type = classic
+            res.add_step(
+                "判定：经典 Test I/II/III",
+                "ok",
+                f"{CLASSIC_LABEL[classic]}（映射行为未测）",
+            )
+            res.warnings.append(
+                "可用服务器不足，映射行为未能测量；结论仅基于 RFC 3489 经典 "
+                "Test I/II/III 判据。若本机为对称型 NAT 且过滤行为宽松，"
+                "锥型结论可能偏乐观，建议补充多台不同 IP 的 STUN 服务器"
+            )
             return
 
         res.classic_type = CLASSIC_UNKNOWN

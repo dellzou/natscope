@@ -206,6 +206,15 @@ def parse_message(data: bytes) -> StunMessage:
     return StunMessage(msg_type=msg_type, transaction_id=tid, attrs=attrs, raw=data)
 
 
+#: BindingResult.error_kind 的取值。判定逻辑**只认这几个枚举值**，不认
+#: error 里那句给人看的描述——否则哪天把 "timeout" 改成 "超时(1.2s)"，
+#: APDF 分支就会永久失效且无人察觉。
+ERR_TIMEOUT = "timeout"
+ERR_OSERROR = "oserror"
+ERR_STUN = "stun"
+ERR_UNKNOWN = "unknown"
+
+
 @dataclass
 class BindingResult:
     """一次 Binding 事务的结果。"""
@@ -218,7 +227,8 @@ class BindingResult:
     rtt_ms: float = 0.0
     error_code: int = 0
     error_reason: str = ""
-    error: str = ""  # 传输层错误描述（超时 / DNS 失败等）
+    error: str = ""  # 传输层错误描述（超时 / DNS 失败等），仅供展示
+    error_kind: str = ""  # 结构化错误类别，见 ERR_* 常量
     message: StunMessage | None = None
 
     @property
@@ -284,6 +294,7 @@ def binding_transaction(
     res = BindingResult()
     payload, tid = build_binding_request(change_ip, change_port)
     last_err = ""
+    last_kind = ""
 
     for _ in range(max(1, attempts)):
         try:
@@ -315,12 +326,16 @@ def binding_transaction(
                 return res
         except socket.timeout:
             last_err = "timeout"
+            last_kind = ERR_TIMEOUT
         except OSError as exc:
             last_err = str(exc)
+            last_kind = ERR_OSERROR
         except StunError as exc:
             last_err = f"非法报文: {exc}"
+            last_kind = ERR_STUN
 
     res.error = last_err or "unknown"
+    res.error_kind = last_kind or ERR_UNKNOWN
     return res
 
 

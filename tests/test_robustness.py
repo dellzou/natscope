@@ -18,6 +18,7 @@
 """
 
 import os
+import socket
 import sys
 import unittest
 from unittest import mock
@@ -30,9 +31,14 @@ from natscope import gateway, nat, stun
 from natscope.nat import (
     CLASSIC_FULL_CONE,
     CLASSIC_RESTRICTED,
+    CLASSIC_UNKNOWN,
     FILT_ADF,
+    FILT_APDF,
     FILT_EIF,
+    FILT_UNKNOWN,
+    MAP_UNKNOWN,
     NatDetector,
+    NatResult,
 )
 from natscope.servers import ProbeResult, StunServer
 
@@ -63,17 +69,23 @@ def make_servers() -> list[ProbeResult]:
     ]
 
 
-class AddressRestrictedNat:
-    """一台"地址受限型 NAT"的模拟器（RFC 3489 的 Restricted Cone）。
+class SimulatedNat:
+    """一台 NAT 的模拟器，默认是"地址受限型"（RFC 3489 Restricted Cone）。
 
     规则只有一条，也是真机行为：**只放行我们主动发过包的源 IP**。
     因此"先朝 OTHER 发过包"会让 Test II 莫名其妙地通过——这正是那个 P0。
+
+    ``strict_filtering=False``  改成"完全锥型"：谁来都放行。
+    ``advertise_other=False``   服务器不宣告 OTHER-ADDRESS（模拟只有 1 台服务器）。
     """
 
-    def __init__(self, other=OTHER):
+    def __init__(self, other=OTHER, advertise_other=True, strict_filtering=True):
         self.other = other
+        self.advertise_other = advertise_other
+        self.strict_filtering = strict_filtering
         self.contacted_ips: set[str] = set()
         self.calls: list[tuple[tuple[str, int], bool, bool]] = []
+        self.attempts_seen: list[int] = []
         #: 执行 Test II（change_ip=True）那一刻，OTHER 的 IP 是否已被预热
         self.other_warmed_at_test2: bool | None = None
 
@@ -88,27 +100,28 @@ class AddressRestrictedNat:
     ) -> stun.BindingResult:
         dest = (dest[0], dest[1])
         self.calls.append((dest, bool(change_ip), bool(change_port)))
+        self.attempts_seen.append(int(attempts))
         res = stun.BindingResult(rtt_ms=1.0)
 
         if change_ip:
             if self.other_warmed_at_test2 is None:
                 self.other_warmed_at_test2 = self.other[0] in self.contacted_ips
-            src = self.other
-            if src[0] not in self.contacted_ips:
+            if self.strict_filtering and self.other[0] not in self.contacted_ips:
                 res.error = "timeout"  # 地址受限型：没主动发过的源 IP 一律丢弃
+                res.error_kind = stun.ERR_TIMEOUT
                 return res
             res.ok = True
-            res.source = src
+            res.source = self.other
             res.mapped = (PUBLIC_IP, PUBLIC_PORT)
             return res
 
         if change_port:
-            src = (dest[0], dest[1] + 1)
-            if dest[0] not in self.contacted_ips:
+            if self.strict_filtering and dest[0] not in self.contacted_ips:
                 res.error = "timeout"
+                res.error_kind = stun.ERR_TIMEOUT
                 return res
             res.ok = True
-            res.source = src
+            res.source = (dest[0], dest[1] + 1)
             res.mapped = (PUBLIC_IP, PUBLIC_PORT)
             return res
 
@@ -117,7 +130,8 @@ class AddressRestrictedNat:
         res.ok = True
         res.source = dest
         res.mapped = (PUBLIC_IP, PUBLIC_PORT)  # 映射端口恒定 → 映射行为必然是 EIM
-        res.other = self.other if dest == (PRIMARY_IP, PRIMARY_PORT) else None
+        if self.advertise_other and dest == (PRIMARY_IP, PRIMARY_PORT):
+            res.other = self.other
         return res
 
     def call_index(self, pred) -> int | None:
@@ -131,7 +145,7 @@ class TestFilteringTestOrder(unittest.TestCase):
     """P0 回归：过滤行为测试不得被多目标采样"预热"。"""
 
     def _run(self):
-        fake = AddressRestrictedNat()
+        fake = SimulatedNat()
         with mock.patch.object(stun, "binding_transaction", fake), mock.patch.object(
             nat, "local_outbound_ip", lambda: ("192.168.1.10", 0)
         ):
@@ -333,6 +347,93 @@ class TestResolveIpv6(unittest.TestCase):
         self.assertFalse(stun._is_ipv6_literal("192.0.2.1"))
         self.assertTrue(stun._is_ipv6_literal("::1"))
         self.assertTrue(stun._is_ipv6_literal("[::1]"))
+
+
+class TestClassicFallback(unittest.TestCase):
+    """P0 回归：过滤行为已测出、映射行为测不出时，不得把已有结论丢掉。"""
+
+    def test_single_server_falls_back_to_classic(self):
+        # 只有 1 台可用服务器且它不宣告 OTHER-ADDRESS → 样本 < 2 → 映射行为不可测；
+        # 但 Test II 已经成功，结论不该是「无法判定」。
+        fake = SimulatedNat(advertise_other=False, strict_filtering=False)
+        with mock.patch.object(stun, "binding_transaction", fake), mock.patch.object(
+            nat, "local_outbound_ip", lambda: ("192.168.1.10", 0)
+        ):
+            result = NatDetector(timeout=0.2).run(make_servers()[:1])
+        self.assertEqual(result.mapping_behavior, MAP_UNKNOWN)
+        self.assertEqual(result.filtering_behavior, FILT_EIF)
+        self.assertEqual(result.classic_type, CLASSIC_FULL_CONE)
+        self.assertTrue(
+            any("经典" in w for w in result.warnings),
+            "回退到经典判据时必须把前提写进警告",
+        )
+
+    def test_nothing_measured_still_reports_unknown(self):
+        res = NatResult(ok=True, local_ip="192.168.1.2", local_port=5000,
+                        public_ip="203.0.113.9", public_port=40001,
+                        mapping_behavior=MAP_UNKNOWN, filtering_behavior=FILT_UNKNOWN)
+        NatDetector()._decide(res)
+        self.assertEqual(res.classic_type, CLASSIC_UNKNOWN)
+
+
+class TestErrorKind(unittest.TestCase):
+    """P1 回归：判定只认结构化 error_kind，不认 error 的措辞。"""
+
+    def test_timeout_sets_structured_kind(self):
+        class SilentSocket:
+            def settimeout(self, value):
+                pass
+
+            def sendto(self, data, dest):
+                pass
+
+            def recvfrom(self, size):
+                raise socket.timeout()
+
+        res = stun.binding_transaction(SilentSocket(), ("192.0.2.1", 3478), timeout=0.01)
+        self.assertFalse(res.ok)
+        self.assertEqual(res.error_kind, stun.ERR_TIMEOUT)
+        self.assertEqual(res.error, "timeout")
+
+    def test_apdf_survives_error_wording_change(self):
+        # 措辞故意换掉：判定仍必须落在 APDF，而不是 unknown
+        def fake(sock, dest, change_ip=False, change_port=False, timeout=1.5, attempts=1):
+            return stun.BindingResult(
+                ok=False, error="timed out (1.2s, 2 attempts)", error_kind=stun.ERR_TIMEOUT
+            )
+
+        res = NatResult()
+        srv = ProbeResult(server=StunServer("stun-a.test", 3478), ok=True, ip=PRIMARY_IP)
+        with mock.patch.object(stun, "binding_transaction", fake):
+            NatDetector()._filter_tests(object(), srv, res)
+        self.assertEqual(res.filtering_behavior, FILT_APDF)
+
+    def test_other_error_kind_does_not_mean_filtered(self):
+        # OSError（例如网络不可达）不等于"被 NAT 过滤"，只能是 unknown
+        def fake(sock, dest, change_ip=False, change_port=False, timeout=1.5, attempts=1):
+            return stun.BindingResult(
+                ok=False, error="network unreachable", error_kind=stun.ERR_OSERROR
+            )
+
+        res = NatResult()
+        srv = ProbeResult(server=StunServer("stun-a.test", 3478), ok=True, ip=PRIMARY_IP)
+        with mock.patch.object(stun, "binding_transaction", fake):
+            NatDetector()._filter_tests(object(), srv, res)
+        self.assertEqual(res.filtering_behavior, FILT_UNKNOWN)
+
+    def test_filter_tests_retry(self):
+        seen: list[int] = []
+
+        def fake(sock, dest, change_ip=False, change_port=False, timeout=1.5, attempts=1):
+            seen.append(attempts)
+            return stun.BindingResult(ok=False, error="timeout", error_kind=stun.ERR_TIMEOUT)
+
+        res = NatResult()
+        srv = ProbeResult(server=StunServer("stun-a.test", 3478), ok=True, ip=PRIMARY_IP)
+        with mock.patch.object(stun, "binding_transaction", fake):
+            NatDetector()._filter_tests(object(), srv, res)
+        self.assertEqual(len(seen), 2, "Test II / III 各应发一次事务")
+        self.assertTrue(all(a >= 2 for a in seen), f"单包重试缺失：attempts={seen}")
 
 
 def struct_pack_h(value: int) -> bytes:
