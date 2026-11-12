@@ -107,8 +107,15 @@ def main(argv: list[str] | None = None) -> int:
         print(f"TXT 已保存: {path}")
     if args.jpg is not None:
         path = args.jpg or default_filename("NatScope报告", "jpg")
-        save_image(ctx, path, get_palette(cfg.theme))
-        print(f"JPG 已保存: {path}")
+        written = save_image(ctx, path, get_palette(cfg.theme))
+        # 分页时 save_image 会写出 报告_1.jpg / 报告_2.jpg，
+        # 这里必须打印真实写出的路径，否则用户按提示的路径找不到文件
+        if len(written) == 1:
+            print(f"JPG 已保存: {written[0]}")
+        else:
+            print(f"JPG 已保存（内容较长，共 {len(written)} 页）:")
+            for item in written:
+                print(f"  {item}")
 
     return 0 if nat.ok else 1
 

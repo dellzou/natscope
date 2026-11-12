@@ -298,6 +298,77 @@ class TestPagination(unittest.TestCase):
             self.assertTrue(os.path.isfile(target))
 
 
+class TestCandidateRendering(unittest.TestCase):
+    """候选态在图上必须只有一种表达：统一描边 + 单个区间标记。"""
+
+    def _block(self, classic: str, kind: str):
+        nat = NatResult(
+            local_ip="10.0.0.2",
+            local_port=40000,
+            public_ip="203.0.113.9",
+            public_port=40000,
+            classic_type=classic,
+        )
+        plan = report.plan_report(report.ReportContext(nat=nat), LIGHT)
+        return plan, next(b for b in plan.pages[0].blocks if b.kind == kind)
+
+    def test_candidate_cells_share_one_outline_color(self):
+        plan, block = self._block(CLASSIC_CONE_UNKNOWN, "matrix")
+        cells = [
+            s
+            for s in block.shapes
+            if s.kind == "rrect" and (s.box[2] - s.box[0]) < plan.width - 200
+        ]
+        self.assertEqual(len(cells), 9, "矩阵应恰好 9 个格子")
+        outlines = [s.outline for s in cells]
+        self.assertEqual(outlines.count(LIGHT.warn), 3, "三个候选格必须是同一个候选色")
+        self.assertEqual(len(set(outlines)), 2, f"只应有候选色+排除色：{set(outlines)}")
+        self.assertNotIn(
+            LIGHT.ok, outlines, "候选格不能出现「绿色=更好」的类型色，那会读出错误信息"
+        )
+
+    def test_candidate_cells_have_no_fill_tint(self):
+        _plan, block = self._block(CLASSIC_CONE_UNKNOWN, "matrix")
+        related = [
+            s
+            for s in block.shapes
+            if s.kind == "rrect" and s.outline == LIGHT.warn
+        ]
+        for shape in related:
+            self.assertEqual(shape.fill, LIGHT.surface, "候选格应为无填充，只留统一描边")
+
+    def test_spectrum_draws_single_span_marker(self):
+        plan, block = self._block(CLASSIC_CONE_UNKNOWN, "spectrum")
+        triangles = [s for s in block.shapes if s.kind == "poly"]
+        self.assertEqual(len(triangles), 1, "候选区间只应有一个三角标记，不是三个")
+        self.assertIn("锥型（三选一，无法细分）", "".join(plan.texts))
+
+    def test_span_marker_sits_at_interval_center(self):
+        _plan, block = self._block(CLASSIC_CONE_UNKNOWN, "spectrum")
+        tri = next(s for s in block.shapes if s.kind == "poly")
+        tri_cx = sum(p[0] for p in tri.points) / len(tri.points)
+        middle = next(line for line in block.lines if line.text == "受限锥型")
+        self.assertAlmostEqual(tri_cx, middle.x, delta=2)
+
+    def test_definite_type_keeps_single_segment_marker(self):
+        _plan, block = self._block(CLASSIC_FULL_CONE, "spectrum")
+        self.assertEqual(len([s for s in block.shapes if s.kind == "poly"]), 1)
+        self.assertNotIn("三选一", "".join(l.text for l in block.lines))
+
+    def test_unknown_has_no_marker(self):
+        _plan, block = self._block(CLASSIC_UNKNOWN, "spectrum")
+        self.assertEqual([s for s in block.shapes if s.kind == "poly"], [])
+
+    def test_active_cell_still_uses_type_color(self):
+        plan, block = self._block(CLASSIC_FULL_CONE, "matrix")
+        cells = [
+            s
+            for s in block.shapes
+            if s.kind == "rrect" and (s.box[2] - s.box[0]) < plan.width - 200
+        ]
+        self.assertIn(LIGHT.ok, [s.outline for s in cells], "测得的那一格仍应呈现类型色")
+
+
 class TestEveryTypeRenders(unittest.TestCase):
     """8 种传统类型都能出图，且都不会因为某个块高度算错而崩。"""
 

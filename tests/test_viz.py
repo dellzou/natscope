@@ -239,6 +239,57 @@ class TestSpectrum(unittest.TestCase):
         self.assertTrue(all(s.state == "dim" for s in segs))
 
 
+class TestCandidatePresentation(unittest.TestCase):
+    """候选态必须「说不出来就是说不出来」，不能借类型色暗示某个更可能。"""
+
+    def test_display_tone_is_uniform_for_candidates(self):
+        mat = viz.build_matrix(NatResult(classic_type=CLASSIC_CONE_UNKNOWN))
+        row = mat.cells[0]
+        self.assertEqual([c.tone for c in row], [viz.TONE_OK, viz.TONE_WARN, viz.TONE_WARN])
+        self.assertEqual(
+            {c.display_tone for c in row},
+            {viz.CANDIDATE_TONE},
+            "三个候选格必须用同一个候选色，否则绿色那格会被读成「更可能」",
+        )
+
+    def test_active_cell_keeps_its_own_tone(self):
+        mat = viz.build_matrix(
+            NatResult(classic_type=CLASSIC_FULL_CONE, filtering_behavior=FILT_EIF)
+        )
+        active = mat.get(MAP_EIM, FILT_EIF)
+        self.assertEqual(active.state, viz.STATE_ACTIVE)
+        self.assertEqual(active.display_tone, active.tone)
+        self.assertEqual(active.display_tone, viz.TONE_OK)
+
+    def test_display_tone_ignores_dim_cells(self):
+        mat = viz.build_matrix(NatResult(classic_type=CLASSIC_FULL_CONE,
+                                        filtering_behavior=FILT_EIF))
+        dim = mat.get(MAP_ADM, FILT_ADF)
+        self.assertEqual(dim.state, viz.STATE_DIM)
+        self.assertEqual(dim.display_tone, dim.tone)
+
+    def test_spectrum_span_covers_the_three_cones(self):
+        segs = viz.build_spectrum(NatResult(classic_type=CLASSIC_CONE_UNKNOWN))
+        span = viz.spectrum_span(segs)
+        self.assertIsNotNone(span)
+        assert span is not None
+        self.assertEqual((span.start, span.end), (1, 3))
+        self.assertEqual(span.length, 3)
+        self.assertEqual(
+            [segs[i].key for i in range(span.start, span.end + 1)],
+            [CLASSIC_FULL_CONE, CLASSIC_RESTRICTED, CLASSIC_PORT_RESTRICTED],
+        )
+        self.assertIn("三选一", span.label)
+        self.assertIn("无法细分", span.label)
+
+    def test_no_span_for_definite_or_unknown(self):
+        for classic in (CLASSIC_OPEN, CLASSIC_FULL_CONE, CLASSIC_SYMMETRIC,
+                        CLASSIC_BLOCKED, CLASSIC_UNKNOWN):
+            with self.subTest(classic=classic):
+                segs = viz.build_spectrum(NatResult(classic_type=classic))
+                self.assertIsNone(viz.spectrum_span(segs))
+
+
 class TestScenarios(unittest.TestCase):
     #: 与需求文档冻结的可用性表逐字对应
     TABLE = {

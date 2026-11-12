@@ -774,26 +774,33 @@ class _Planner:
         title_lh = m.line("section")
         bar_h = self.s(12)
         title_y = self.s(18)
+        span = viz.spectrum_span(segs)
         bar_y = title_y + title_lh + self.s(16)
         label_y = bar_y + bar_h + self.s(14)
         sub_y = label_y + m.line("small") + self.s(2)
-        h = sub_y + m.line("tiny") + self.s(18)
+        span_y = sub_y + m.line("tiny") + self.s(8)
+        h = (span_y + m.line("tiny") if span else sub_y + m.line("tiny")) + self.s(18)
 
         n = len(segs)
         seg_w = max(self.s(40), (inner_w - gap * (n - 1)) // n)
 
         current = [s for s in segs if s.state == "current"]
-        candidates = [s for s in segs if s.state == "candidate"]
         if current:
             caption = "当前 · " + current[0].label
             cap_tone = current[0].tone
-        elif candidates:
-            caption = "可能 · " + " / ".join(s.label for s in candidates)
+        elif span:
+            # 候选是「落在区间内」，不是「三个都命中」，措辞别写成并列
+            caption = "可能 · 落在区间内"
             cap_tone = viz.TONE_WARN
         else:
             caption = "结论未定"
             cap_tone = viz.TONE_NA
 
+        warn = p.warn
+        cand_fill = _mix_hex(p.surface, warn, 0.28)
+        grow = self.s(2)
+        first_x = last_x = 0
+        mid = 0
         shapes: list[_Shape] = [self._card(self.pad, self.width - self.pad, h, p.surface, p.border)]
         lines: list[_Line] = [
             _Line("类型谱 Spectrum", "section", p.text, x0, title_y),
@@ -806,46 +813,97 @@ class _Planner:
                 "rm",
             ),
         ]
+
+        if span is not None:
+            # 三段候选 = **一条**区间条（不是三个胶囊）：整段画一个略加粗的胶囊，
+            # 内部再用卡片底色细线分出三段，读作「落在这三段构成的区间内」。
+            first_x = x0 + span.start * (seg_w + gap)
+            last_x = x0 + span.end * (seg_w + gap) + seg_w
+            mid = (first_x + last_x) // 2
+            shapes.append(
+                _Shape(
+                    "rrect",
+                    (first_x, bar_y - grow, last_x, bar_y + bar_h + grow),
+                    fill=cand_fill,
+                    outline=warn,
+                    radius=max(1, bar_h // 2 + grow),
+                )
+            )
+            for k in range(span.start, span.end):
+                x_div = x0 + k * (seg_w + gap) + seg_w + gap // 2
+                shapes.append(
+                    _Shape(
+                        "line",
+                        (x_div, bar_y + self.s(1), x_div, bar_y + bar_h - self.s(1)),
+                        fill=p.surface,
+                        width=max(1, self.s(1)),
+                    )
+                )
+
         for i, seg in enumerate(segs):
             sx = x0 + i * (seg_w + gap)
             cx = sx + seg_w // 2
             tone = _tone_color(p, seg.tone)
+            in_span = span is not None and span.start <= i <= span.end
             if seg.state == "current":
-                fill, outline, text_color, marker = tone, tone, p.text, tone
+                fill, outline, text_color = tone, tone, p.text
             elif seg.state == "candidate":
                 # 候选一律用「不确定」的警示色，不跟着各自的语义色走：
                 # 完全锥型那段是绿色的话，看起来像「这个已经确定了」。
-                warn = p.warn
-                fill = _mix_hex(p.surface, warn, 0.35)
-                outline = warn
-                text_color = p.text_dim
-                marker = warn
+                fill, outline, text_color = cand_fill, warn, p.text_dim
             else:
-                fill, outline, text_color, marker = p.overlay, p.grid, p.text_faint, tone
-            shapes.append(
-                _Shape(
-                    "rrect",
-                    (sx, bar_y, sx + seg_w, bar_y + bar_h),
-                    fill=fill,
-                    outline=outline,
-                    radius=max(1, bar_h // 2),
-                )
-            )
-            if seg.state in ("current", "candidate"):
-                tip = self.s(9)
+                fill, outline, text_color = p.overlay, p.grid, p.text_faint
+            if not in_span:  # 候选段整体由上面那条区间条表达
                 shapes.append(
                     _Shape(
-                        "poly",
-                        points=(
-                            (cx - tip // 2, bar_y - tip),
-                            (cx + tip // 2, bar_y - tip),
-                            (cx, bar_y - self.s(1)),
-                        ),
-                        fill=marker,
+                        "rrect",
+                        (sx, bar_y, sx + seg_w, bar_y + bar_h),
+                        fill=fill,
+                        outline=outline,
+                        radius=max(1, bar_h // 2),
                     )
                 )
             lines.append(_Line(seg.label, "small", text_color, cx, label_y, "ma"))
             lines.append(_Line(seg.sub, "tiny", p.text_faint, cx, sub_y, "ma"))
+
+        tip = self.s(9)
+        if span is not None:
+            # 区间中央放**一个**三角。三段各画一个会读成「三个都命中」或「要挑一个」。
+            base_y = bar_y - grow - self.s(1)
+            shapes.append(
+                _Shape(
+                    "poly",
+                    points=(
+                        (mid - tip // 2, base_y - tip),
+                        (mid + tip // 2, base_y - tip),
+                        (mid, base_y),
+                    ),
+                    fill=warn,
+                )
+            )
+            lines.append(
+                _Line(
+                    m.ellipsize("tiny", span.label, last_x - first_x),
+                    "tiny",
+                    warn,
+                    mid,
+                    span_y,
+                    "ma",
+                )
+            )
+        elif current:
+            cx = x0 + segs.index(current[0]) * (seg_w + gap) + seg_w // 2
+            shapes.append(
+                _Shape(
+                    "poly",
+                    points=(
+                        (cx - tip // 2, bar_y - tip),
+                        (cx + tip // 2, bar_y - tip),
+                        (cx, bar_y - self.s(1)),
+                    ),
+                    fill=_tone_color(p, current[0].tone),
+                )
+            )
         return _Block(
             kind="spectrum",
             height=h + self.s(18),
@@ -918,13 +976,16 @@ class _Planner:
             for j, cell in enumerate(mat.cells[i]):
                 cx0 = x0 + row_head_w + gap + j * (col_w + gap)
                 cx1 = cx0 + col_w
-                tone = _tone_color(p, cell.tone)
+                # 候选格用统一的候选色（display_tone），不显示各自的类型色：
+                # 「完全锥型」那格若是绿色，会读出「它更可能是对的」，
+                # 而结论恰恰是「三者分不出来」。
+                tone = _tone_color(p, cell.display_tone)
                 if cell.state == viz.STATE_ACTIVE:
                     fill = _mix_hex(p.surface, tone, 0.18)
                     outline = tone
                     title_color = tone
                 elif cell.state == viz.STATE_RELATED:
-                    fill = _mix_hex(p.surface, tone, 0.10)
+                    fill = p.surface  # 无填充：只有统一描边 + 统一色点
                     outline = tone
                     title_color = p.text
                 elif cell.state == viz.STATE_NA:

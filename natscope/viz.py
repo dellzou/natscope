@@ -61,6 +61,14 @@ TONE_WARN = "warn"
 TONE_BAD = "bad"
 TONE_NA = "na"
 
+#: 候选态的统一色调。
+#:
+#: 候选意味着「无法细分」，此时各格/各段自带的类型色（绿色＝好、橙色＝存疑）
+#: 会读出「绿色那个更可能是对的」这种错误信息，所以**渲染时一律忽略
+#: 各自的 tone**，统一用本色调。消费方请用 :attr:`Cell.display_tone`
+#: 或直接引用本常量，不要拿 ``cell.tone`` 去上色。
+CANDIDATE_TONE = TONE_WARN
+
 #: 传统类型 -> 语义色调。全项目**唯一**的类型语义映射，
 #: ``theme.type_color`` 负责把它翻译成具体颜色。
 TONE_BY_TYPE: dict[str, str] = {
@@ -154,6 +162,10 @@ class Cell:
 
     ``state`` 决定怎么强调（是否高亮），``tone`` 决定用什么语义色；
     两者正交——灰显的格子照样带 tone，换主题时不需要重新计算。
+
+    **上色请用** :attr:`display_tone` **而不是** ``tone``：候选格（``related``）
+    必须忽略各自的类型色，否则「完全锥型」那格会显示成绿色，读起来像
+    「这个更可能」。
     """
 
     row: str
@@ -162,6 +174,11 @@ class Cell:
     sub: str
     state: str
     tone: str
+
+    @property
+    def display_tone(self) -> str:
+        """渲染用色调：候选态统一 :data:`CANDIDATE_TONE`，其余用自身 tone。"""
+        return CANDIDATE_TONE if self.state == STATE_RELATED else self.tone
 
 
 @dataclass(frozen=True)
@@ -201,6 +218,24 @@ class SpectrumSegment:
     state: str  # current / candidate / dim / na
     score: int
     hint: str
+
+
+@dataclass(frozen=True)
+class SpectrumSpan:
+    """类型谱上一段**连续候选区间**。
+
+    三个候选段各自画一个三角，会读成「三个都命中」或「三选一，挑一个」；
+    正确含义是「落在这三段构成的区间里」。所以消费方应该画**一条横跨区间
+    的加粗条 + 一个居中的三角**，而不是三段各画一个。
+    """
+
+    start: int
+    end: int
+    label: str
+
+    @property
+    def length(self) -> int:
+        return self.end - self.start + 1
 
 
 @dataclass(frozen=True)
@@ -401,6 +436,25 @@ def build_spectrum(nat: NatResult) -> tuple[SpectrumSegment, ...]:
     return tuple(segments)
 
 
+def spectrum_span(segments: tuple[SpectrumSegment, ...]) -> SpectrumSpan | None:
+    """取出连续 ``candidate`` 段构成的区间；没有候选段时返回 ``None``。
+
+    目前只有「锥型不可细分」会产生候选区间（完全锥型 / 受限锥型 /
+    端口受限锥型三段），标签直接写成「锥型（三选一，无法细分）」；
+    其他情况按段名拼接，保证函数本身不绑死在某一种结论上。
+    """
+    idx = [i for i, s in enumerate(segments) if s.state == "candidate"]
+    if not idx:
+        return None
+    start, end = idx[0], idx[-1]
+    keys = [s.key for s in segments[start:end + 1]]
+    if keys == list(_CONE_KEYS):
+        label = "锥型（三选一，无法细分）"
+    else:
+        label = " / ".join(s.label for s in segments[start:end + 1])
+    return SpectrumSpan(start=start, end=end, label=label)
+
+
 # --------------------------------------------------------------------------
 # 映射样本
 # --------------------------------------------------------------------------
@@ -561,6 +615,7 @@ def verdict(nat: NatResult) -> tuple[str, str, str]:
 
 __all__ = [
     "Badge",
+    "CANDIDATE_TONE",
     "COL_CODE",
     "COL_LABEL",
     "Cell",
@@ -581,6 +636,7 @@ __all__ = [
     "SampleChip",
     "Scenario",
     "SpectrumSegment",
+    "SpectrumSpan",
     "TONE_BAD",
     "TONE_BY_TYPE",
     "TONE_NA",
@@ -591,6 +647,7 @@ __all__ = [
     "build_samples",
     "build_scenarios",
     "build_spectrum",
+    "spectrum_span",
     "type_tone",
     "verdict",
 ]
