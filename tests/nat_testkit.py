@@ -39,6 +39,7 @@ NAT 类型判定的关键性质是「**一条 NAT 通道（本地 socket / 内�
 
 from __future__ import annotations
 
+from contextlib import ExitStack
 from typing import NamedTuple
 from unittest.mock import patch
 
@@ -62,6 +63,7 @@ class Call(NamedTuple):
     change_ip: bool
     change_port: bool
     attempts: int
+    timeout: float  # 本次调用被分配到的单包超时（预算紧张时会被压缩）
 
     @property
     def is_change_request(self) -> bool:
@@ -74,6 +76,27 @@ class _Channel:
     def __init__(self) -> None:
         self.allowed_ips: set[str] = set()
         self.allowed_endpoints: set[tuple[str, int]] = set()
+
+
+class FakeClock:
+    """可控时钟：只为验证「时间预算」这类与真实耗时耦合的逻辑。
+
+    用法：`run_detector(..., clock=clock)` 会把 `natscope.nat.time.perf_counter`
+    换成 `clock.perf_counter`、`time.sleep` 换成会推进时钟的 `clock.sleep`，
+    于是"等满 timeout 却什么都没收到"也能在毫秒内被精确复现，且完全可重复。
+    """
+
+    def __init__(self, start: float = 1000.0) -> None:
+        self.now = float(start)
+
+    def perf_counter(self) -> float:
+        return self.now
+
+    def sleep(self, seconds: float) -> None:
+        self.advance(seconds)
+
+    def advance(self, seconds: float) -> None:
+        self.now += max(0.0, float(seconds))
 
 
 class FakeStunNetwork:
@@ -92,6 +115,15 @@ class FakeStunNetwork:
         若实现把重试做进同一次事务（``attempts >= 2``），丢包被同事务吃掉；
         若实现改成外层多次调用（每次 ``attempts == 1``），第二次调用会成功。
         两种实现都能通过，因此它测的是行为而不是实现。
+    odd_dest / odd_port
+        只让某一个目的返回不同的映射端口（模拟单条离群样本）。
+        用于 P1-18：单个测量伪影不得把 EIM 翻转成对称型。
+    response_latency
+        回包时延（秒）。若某次调用的 ``timeout`` 小于它，就当"回包来得太晚"——
+        按超时处理。这是 `FILTER_BUDGET_S` 那种"没等够就判失败"场景的建模手段。
+    clock
+        传入 `FakeClock` 时，替身会把"等满 timeout 才超时"计入时钟，
+        让预算消耗过程与真机一致。
     change_port_supported
         服务器是否实现 change_port。设 False 后：**只改端口**的 CHANGE-REQUEST
         一律超时（模拟"服务器压根不实现这个属性"，而不是 NAT 在过滤）。
@@ -116,6 +148,10 @@ class FakeStunNetwork:
         drop_first: set[tuple[bool, bool]] | None = None,
         other_unreachable: bool = False,
         change_port_supported: bool = True,
+        response_latency: float = 0.0,
+        clock: "FakeClock | None" = None,
+        odd_dest: tuple[str, int] | None = None,
+        odd_port: int | None = None,
     ) -> None:
         self.primary = tuple(primary)
         self.other = tuple(other) if other else None
@@ -124,6 +160,11 @@ class FakeStunNetwork:
         self.timeout_text = timeout_text
         self.other_unreachable = other_unreachable
         self.change_port_supported = change_port_supported
+        self.response_latency = response_latency
+        self.clock = clock
+        # 某单个目的返回不同映射端口：模拟"离群样本"（P1-18 用）
+        self.odd_dest = tuple(odd_dest) if odd_dest else None
+        self.odd_port = odd_port
         self._drop_first = {(bool(a), bool(b)) for a, b in (drop_first or set())}
         self._dropped: set[tuple[bool, bool]] = set()
         self.calls: list[Call] = []
@@ -175,7 +216,7 @@ class FakeStunNetwork:
             f"{'CHANGE' if c.is_change_request else 'binding'}"
             f"{' change_ip' if c.change_ip else ''}"
             f"{' change_port' if c.change_port else ''} "
-            f"→ {c.dest[0]}:{c.dest[1]} (attempts={c.attempts})"
+            f"→ {c.dest[0]}:{c.dest[1]} (attempts={c.attempts}, timeout={c.timeout:g}s)"
             for i, c in enumerate(self.calls)
         )
 
@@ -194,28 +235,45 @@ class FakeStunNetwork:
         change_ip, change_port = bool(change_ip), bool(change_port)
         dest = tuple(dest)
         channel = self._channel(sock)
-        self.calls.append(Call(sock, dest, change_ip, change_port, int(attempts or 1)))
+        self.calls.append(
+            Call(sock, dest, change_ip, change_port, int(attempts or 1), float(timeout or 0.0))
+        )
 
         if not (change_ip or change_port):
             # 包已经发出去了 → 真实 NAT 的白名单一定被写进这张表（与回不回包无关）
             channel.allowed_ips.add(dest[0])
             channel.allowed_endpoints.add(dest)
             if self._unreachable(dest):
-                return self._timeout()
-            return self._success(source=dest)
+                return self._settle(self._timeout(), timeout)
+            return self._settle(self._success(source=dest, dest=dest), timeout)
 
         if change_port and not change_ip and not self.change_port_supported:
             # 服务器不实现 change_port：这是"服务器能力"问题，与 NAT 过滤无关
-            return self._timeout()
+            return self._settle(self._timeout(), timeout)
 
         source = self._change_source(dest, change_ip, change_port)
         if not self._filter_allows(channel, source):
-            return self._timeout()
+            return self._settle(self._timeout(), timeout)
         if self._should_drop(change_ip, change_port, attempts):
-            return self._timeout()
+            return self._settle(self._timeout(), timeout)
         if self._unreachable(source):
-            return self._timeout()
-        return self._success(source=source)
+            return self._settle(self._timeout(), timeout)
+        return self._settle(self._success(source=source, dest=dest), timeout)
+
+    def _settle(self, result: "stun.BindingResult", timeout: float) -> "stun.BindingResult":
+        """把"回包时延"与"预算压力"折算进结果和时钟。
+
+        * `timeout < response_latency` → 回包来得比愿意等的更晚，按超时处理
+          （这正是 `min(FILTER_TIMEOUT_S, remain)` 在预算将尽时压出来的偏差）；
+        * 成功 → 时钟推进 `response_latency`；超时 → 推进 `timeout`，
+          让后续的 `remain` 计算与真机一致。
+        """
+        if result.ok and self.response_latency > 0 and timeout is not None:
+            if timeout < self.response_latency:
+                result = self._timeout()
+        if self.clock is not None:
+            self.clock.advance(self.response_latency if result.ok else float(timeout or 0.0))
+        return result
 
     # ---- 内部 ----
     def _unreachable(self, addr: tuple[str, int]) -> bool:
@@ -245,10 +303,17 @@ class FakeStunNetwork:
         self._dropped.add(kind)
         return attempts <= 1
 
-    def _success(self, source: tuple[str, int]) -> "stun.BindingResult":
+    def _mapped_port_for(self, dest: tuple[str, int] | None) -> int:
+        if self.odd_dest is not None and self.odd_port is not None and dest == self.odd_dest:
+            return self.odd_port
+        return self.mapped_port
+
+    def _success(
+        self, source: tuple[str, int], dest: tuple[str, int] | None = None
+    ) -> "stun.BindingResult":
         r = stun.BindingResult()
         r.ok = True
-        r.mapped = (MAPPED_IP, self.mapped_port)
+        r.mapped = (MAPPED_IP, self._mapped_port_for(dest))
         r.source = tuple(source)
         r.other = self.other
         r.rtt_ms = 20.0
@@ -275,15 +340,33 @@ def make_probe(ip: str, port: int = 3478, rfc5780: bool = True, rtt: float = 20.
     )
 
 
-def run_detector(fake: FakeStunNetwork, probes: list[ProbeResult], max_samples: int = 6):
+def run_detector(
+    fake: FakeStunNetwork,
+    probes: list[ProbeResult],
+    max_samples: int = 6,
+    clock: "FakeClock | None" = None,
+):
     """在打桩环境下执行一次完整检测（不产生任何真实 UDP 报文）。
 
-    同时把 `time.sleep` 换成空操作：被测实现为了规避服务器限流会在两次
+    默认把 `time.sleep` 换成空操作：被测实现为了规避服务器限流会在两次
     CHANGE-REQUEST 之间 sleep（150~250 ms），那是**发送节奏**而不是判定逻辑。
     真实发包已被替身接管，保留 sleep 只会让单测从毫秒级涨到秒级，CI 上纯属浪费。
+
+    传 `clock` 时改用假时钟（`perf_counter` + `sleep` 都走 `FakeClock`），
+    用于验证「时间预算」这类与真实耗时耦合的逻辑 —— 毫秒内跑完，且完全可重复。
     """
     detector = NatDetector(timeout=0.05, log=lambda msg: None)
-    with patch.object(natmod, "local_outbound_ip", return_value=(LOCAL_IP, 0)), patch.object(
-        stun, "binding_transaction", side_effect=fake
-    ), patch.object(natmod.time, "sleep", lambda *_a, **_kw: None):
+    patches = [
+        patch.object(natmod, "local_outbound_ip", return_value=(LOCAL_IP, 0)),
+        patch.object(stun, "binding_transaction", side_effect=fake),
+    ]
+    if clock is None:
+        patches.append(patch.object(natmod.time, "sleep", lambda *_a, **_kw: None))
+    else:
+        fake.clock = clock
+        patches.append(patch.object(natmod.time, "sleep", clock.sleep))
+        patches.append(patch.object(natmod.time, "perf_counter", clock.perf_counter))
+    with ExitStack() as stack:
+        for item in patches:
+            stack.enter_context(item)
         return detector.run(probes, max_samples=max_samples)
