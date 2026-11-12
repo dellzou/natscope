@@ -39,9 +39,16 @@ jobs:
           print(f"body chars: {len(body)}")
           PY
 
+          # 先按 tag 取 id —— PATCH 只能打在 /releases/{id} 上，
+          # /releases/tags/{tag} 只有 GET，打 PATCH 会 404。
+          curl -sS "${AUTH[@]}" "${API}/releases/tags/${TAG}" -o rel.json -w "get=%{http_code}\n"
+          RID=$(python3 -c "import json;print(json.load(open('rel.json')).get('id',''))")
+          if [ -z "$RID" ]; then echo "取不到 release id"; exit 1; fi
+          echo "release id=$RID"
+
           # 只 PATCH body，其余字段一个都不传
           curl -sS -X PATCH "${AUTH[@]}" --data-binary @body.json \
-            "${API}/releases/tags/${TAG}" -o resp.json -w "http=%{http_code}\n"
+            "${API}/releases/${RID}" -o resp.json -w "http=%{http_code}\n"
 
           python3 - <<'PY'
           import json, pathlib, sys
