@@ -1,0 +1,64 @@
+name: build-release
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    runs-on: windows-latest
+
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Python 3.13
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+
+      - name: Run unit tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Build single-file exe
+        run: pyinstaller natscope.spec --noconfirm --clean
+
+      - name: Show build output
+        run: |
+          dir dist
+          (Get-Item dist\NatScope.exe).Length / 1MB
+
+      - name: Upload build artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NatScope-exe
+          path: dist/NatScope.exe
+          if-no-files-found: error
+
+      - name: Publish GitHub Release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          $tag = if ($env:GITHUB_REF -like "refs/tags/*") {
+            $env:GITHUB_REF -replace "^refs/tags/", ""
+          } else {
+            git describe --tags --abbrev=0
+          }
+          Write-Host "Releasing $tag"
+          gh release view $tag *> $null
+          if ($LASTEXITCODE -ne 0) {
+            gh release create $tag --title "NatScope $tag" --generate-notes
+          }
+          gh release upload $tag dist/NatScope.exe --clobber
+          Write-Host "Release ready: https://github.com/${{ github.repository }}/releases/tag/$tag"
