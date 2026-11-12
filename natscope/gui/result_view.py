@@ -216,6 +216,25 @@ class CanvasView(tk.Canvas):
     def _empty(self, width: int, height: int, text: str = "尚未检测") -> None:
         self._label(width / 2.0, height / 2.0, text, field="text_faint", anchor="center")
 
+    @staticmethod
+    def _stack(top: float, fonts, gap: float = 0.0) -> tuple[float, list[float]]:
+        """按**字体度量**把若干行文字纵向堆叠，返回 ``(总高, 各行中心 y)``。
+
+        为什么不用 ``cy ± px(7)`` 这类固定偏移：文字行高来自字体度量
+        （``linespace``），它随缩放非线性变化（tk 是 ``1.333 × 缩放`` 像素/点），
+        而偏移是线性的。两者在 100% 与 125% 下差了 1~5px，正好让标题与副标题
+        的字符撞在一起（125% 下实测："两行需要 43px，行距只给了 42px"）。
+        用度量算，任何 DPI 都不会撞。
+        """
+        heights = [f.metrics("linespace") for f in fonts]
+        total = sum(heights) + gap * max(0, len(fonts) - 1)
+        centers: list[float] = []
+        cursor = float(top)
+        for height in heights:
+            centers.append(cursor + height / 2.0)
+            cursor += height + gap
+        return total, centers
+
     def _heading(self, text: str, extra: str = "") -> None:
         """左上角小标题 + 右侧灰色补充说明。"""
         baseline = px(self.scale, 8)
@@ -364,23 +383,29 @@ class MatrixView(CanvasView):
 
         ink_color = tone if not ink else self._ink(ink)
         center_x = x0 + w / 2.0
-        if show_sub and h >= px(self.scale, 44):
+        title_font = font(Typography.body if h >= px(self.scale, 44) else Typography.label,
+                          bold=bold)
+        sub_font = font(Typography.label)
+        # 标题 + 英文副名：按字体度量堆叠并整体居中（固定 ±px(7)/px(9) 在
+        # 100%/125% 下会让两行字挤在一起）
+        block_h, centers = self._stack(0.0, (title_font, sub_font))
+        if show_sub and block_h <= h - px(self.scale, 4):
+            top = y0 + (h - block_h) / 2.0
             self.create_text(
-                center_x, y0 + h / 2.0 - px(self.scale, 7),
-                text=ellipsis(cell.title, font(Typography.body, bold=bold), w - px(self.scale, 8)),
-                fill=ink_color, font=font(Typography.body, bold=bold), anchor="center",
+                center_x, top + centers[0],
+                text=ellipsis(cell.title, title_font, w - px(self.scale, 8)),
+                fill=ink_color, font=title_font, anchor="center",
             )
-            self._label(
-                center_x, y0 + h / 2.0 + px(self.scale, 9), cell.sub,
-                size=Typography.label, field="text_faint", anchor="center",
-                limit=w - px(self.scale, 8),
+            self.create_text(
+                center_x, top + centers[1],
+                text=ellipsis(cell.sub, sub_font, w - px(self.scale, 8)),
+                fill=palette.text_faint, font=sub_font, anchor="center",
             )
         else:
-            size = Typography.body if h >= px(self.scale, 44) else Typography.label
             self.create_text(
                 center_x, y0 + h / 2.0,
-                text=ellipsis(cell.title, font(size, bold=bold), w - px(self.scale, 4)),
-                fill=ink_color, font=font(size, bold=bold), anchor="center",
+                text=ellipsis(cell.title, title_font, w - px(self.scale, 4)),
+                fill=ink_color, font=title_font, anchor="center",
             )
 
     def _draw_overlay(self, note: str, x0: float, y0: float, w: float, h: float) -> None:
@@ -492,7 +517,11 @@ class SpectrumView(CanvasView):
         warn = palette.warn
         head_h = px(self.scale, 20)
         bar_h = max(px(self.scale, 10), px(self.scale, 14))
-        bar_top = head_h + px(self.scale, 10)
+        bar_top = head_h + px(self.scale, 8)
+        label_font = font(Typography.label)
+        sub_font = font(Typography.label)
+        label_block, label_centers = self._stack(0.0, (label_font, sub_font))
+        label_top = bar_top + bar_h + px(self.scale, 2)
         count = len(segments)
         gap = max(1, px(self.scale, 3))
         seg_w = max(1.0, (width - gap * (count - 1)) / float(count))
@@ -552,15 +581,16 @@ class SpectrumView(CanvasView):
                                       min(px(self.scale, 3), bar_h / 2)),
                     fill=fill, outline=outline, width=HAIRLINE,
                 )
-            self._label(
-                x0 + seg_w / 2.0, bar_top + bar_h + px(self.scale, 3),
-                segment.label, size=Typography.label, field=ink, bold=bold, anchor="n",
-                limit=seg_w - px(self.scale, 2),
+            font_label = font(Typography.label, bold=bold)
+            self.create_text(
+                x0 + seg_w / 2.0, label_top + label_centers[0],
+                text=ellipsis(segment.label, font_label, seg_w - px(self.scale, 2)),
+                fill=self._ink(ink), font=font_label, anchor="center",
             )
-            self._label(
-                x0 + seg_w / 2.0, bar_top + bar_h + px(self.scale, 14),
-                segment.sub, size=Typography.label, field="text_faint", anchor="n",
-                limit=seg_w - px(self.scale, 2),
+            self.create_text(
+                x0 + seg_w / 2.0, label_top + label_centers[1],
+                text=ellipsis(segment.sub, sub_font, seg_w - px(self.scale, 2)),
+                fill=palette.text_faint, font=sub_font, anchor="center",
             )
 
         half = px(self.scale, 5)
@@ -572,10 +602,10 @@ class SpectrumView(CanvasView):
                 fill=warn, outline="",
             )
             self.create_text(
-                mid, bar_top + bar_h + px(self.scale, 25),
-                text=ellipsis(span.label, font(Typography.label),
+                mid, label_top + label_block + px(self.scale, 2),
+                text=ellipsis(span.label, label_font,
                               int((span.end - span.start + 1) * (seg_w + gap))),
-                fill=warn, font=font(Typography.label), anchor="n",
+                fill=warn, font=label_font, anchor="n",
             )
         elif current:
             marker_x = segments.index(current[0]) * (seg_w + gap) + seg_w / 2.0
@@ -650,9 +680,11 @@ class SamplesView(CanvasView):
         head_h = px(self.scale, 22)
         chip_h = px(self.scale, 22)
         chip_gap = px(self.scale, 6)
-        # 行距要能容下括线与端口标注，否则上一行的括线会贴到下一行 chip 上
-        row_gap = px(self.scale, 17)
         text_font = font(Typography.note, family=MONO_FAMILY)
+        port_font = font(Typography.label)
+        # 行距 = 括线间距 + 端口标注行高 + 呼吸空间；固定 px(17) 在 200% 下
+        # 会让「端口 53412」压到下一行 chip 上
+        row_gap = px(self.scale, 3) + port_font.metrics("linespace") + px(self.scale, 6)
         # 端口 -> 配色序号：同一映射端口用同一浅底，视觉上自动成组
         port_order: dict[str, int] = {}
         for chip in chips:
@@ -749,31 +781,37 @@ class ScenariosView(CanvasView):
         count = len(scenarios)
         column_w = width / float(count)
         dot_r = max(3, px(self.scale, 5))
-        center_y = height - px(self.scale, 26)
+        label_font = font(Typography.body)
+        hint_font = font(Typography.label)
+        # 两行文字按度量堆叠并整体垂直居中（固定 ±px(6) 在 125% 下会撞行）
+        block_h, centers = self._stack(0.0, (label_font, hint_font))
+        top = max(px(self.scale, 20), (height - block_h) / 2.0)
+        center_y = top + block_h / 2.0
         for index, scenario in enumerate(scenarios):
             x = column_w * index
             dot_x = x + dot_r
             color = tone_color(palette, scenario.tone)
             if scenario.level == "na":
                 self.create_oval(
-                    dot_x - dot_r, center_y - dot_r, dot_x + dot_r, center_y + dot_r,
+                    dot_x - dot_r, top + centers[0] - dot_r, dot_x + dot_r, top + centers[0] + dot_r,
                     outline=color, width=HAIRLINE, fill="",
                 )
             else:
                 self.create_oval(
-                    dot_x - dot_r, center_y - dot_r, dot_x + dot_r, center_y + dot_r,
+                    dot_x - dot_r, top + centers[0] - dot_r, dot_x + dot_r, top + centers[0] + dot_r,
                     fill=color, outline=color, width=HAIRLINE,
                 )
             text_left = dot_x + dot_r + px(self.scale, 6)
-            self._label(
-                text_left, center_y - px(self.scale, 6), scenario.label,
-                size=Typography.body, field="text", anchor="w",
-                limit=column_w - (text_left - x) - px(self.scale, 8),
+            room = int(column_w - (text_left - x) - px(self.scale, 8))
+            self.create_text(
+                text_left, top + centers[0],
+                text=ellipsis(scenario.label, label_font, room),
+                fill=palette.text, font=label_font, anchor="w",
             )
-            self._label(
-                text_left, center_y + px(self.scale, 6), scenario.hint,
-                size=Typography.label, field="text_dim", anchor="w",
-                limit=column_w - (text_left - x) - px(self.scale, 8),
+            self.create_text(
+                text_left, top + centers[1],
+                text=ellipsis(scenario.hint, hint_font, room),
+                fill=palette.text_dim, font=hint_font, anchor="w",
             )
 
 
@@ -834,19 +872,35 @@ class StepsView(CanvasView):
         self._steps: tuple[TestStep, ...] = ()
         super().__init__(parent, palette, scale, height=height, surface=surface)
 
+    # ---- 度量 ----
+
+    def _metrics(self) -> tuple[float, float, object, object]:
+        """返回 ``(行高, 表头高, 名称字体, 详情字体)``。
+
+        行高由**字体度量**推导：名称行 + 详情行 + 上下呼吸空间。固定
+        ``px(34)`` 在 100% / 125% 下都装不下两行（实测 35/43px 需要，却只有
+        34/42px 可用），两行字符会撞在一起。
+        """
+        name_font = font(Typography.body, bold=True)
+        detail_font = font(Typography.label)
+        pad_y = px(self.scale, 6)
+        row_h = (
+            name_font.metrics("linespace") + detail_font.metrics("linespace") + pad_y * 2
+        )
+        return float(row_h), float(px(self.scale, 22)), name_font, detail_font
+
     def set_steps(self, steps) -> None:
         self._steps = tuple(steps or ())
-        row_h = px(self.scale, 34)
-        head_h = px(self.scale, 22)
+        row_h, head_h, _name, _detail = self._metrics()
         wanted = head_h + max(1, len(self._steps)) * row_h
-        super().configure(height=max(px(self.scale, self.DEFAULT_HEIGHT), wanted))
+        super().configure(height=max(px(self.scale, self.DEFAULT_HEIGHT), int(wanted)))
         self.invalidate()
 
     def _draw(self, width: int, height: int) -> None:
         palette = self.palette
         steps = self._steps
-        head_h = px(self.scale, 22)
-        row_h = px(self.scale, 34)
+        row_h, head_h, name_font, detail_font = self._metrics()
+        pad_y = px(self.scale, 6)
         self._heading("检测步骤", "Test I / II / III 与行为采样")
         if not steps:
             self._label(0, head_h + px(self.scale, 8), "尚无步骤记录",
@@ -856,7 +910,8 @@ class StepsView(CanvasView):
         radius = max(3, px(self.scale, 6))
         icon_x = dot_x + radius + px(self.scale, 7)
         text_left = icon_x + px(self.scale, 11)
-        limit = max(px(self.scale, 60), width - text_left)
+        limit = max(px(self.scale, 60), int(width - text_left))
+        _total, centers = self._stack(0.0, (name_font, detail_font))
 
         # 先画连接线，让节点盖在线上
         if len(steps) > 1:
@@ -869,7 +924,10 @@ class StepsView(CanvasView):
         for index, step in enumerate(steps):
             icon, field = status_style(step.status)
             color = self._ink(field)
-            center_y = head_h + row_h * index + row_h / 2.0
+            row_top = head_h + row_h * index
+            name_y = row_top + pad_y + centers[0]
+            detail_y = row_top + pad_y + centers[1]
+            center_y = row_top + row_h / 2.0
             if step.status == "pending":
                 self.create_oval(
                     dot_x - radius, center_y - radius, dot_x + radius, center_y + radius,
@@ -880,19 +938,19 @@ class StepsView(CanvasView):
                     dot_x - radius, center_y - radius, dot_x + radius, center_y + radius,
                     fill=color, outline=color, width=HAIRLINE,
                 )
-            self._label(
-                icon_x, center_y, icon, size=Typography.body, field=field,
-                bold=True, anchor="w",
+            self.create_text(
+                icon_x, name_y, text=icon, fill=color, font=name_font, anchor="w",
             )
-            self._label(
-                text_left, center_y - px(self.scale, 7), step.name,
-                size=Typography.body, field="text", bold=True, anchor="w",
-                limit=limit,
+            self.create_text(
+                text_left, name_y,
+                text=ellipsis(step.name, name_font, limit),
+                fill=palette.text, font=name_font, anchor="w",
             )
             if step.detail:
-                self._label(
-                    text_left, center_y + px(self.scale, 7), step.detail,
-                    size=Typography.label, field="text_dim", anchor="w", limit=limit,
+                self.create_text(
+                    text_left, detail_y,
+                    text=ellipsis(step.detail, detail_font, limit),
+                    fill=palette.text_dim, font=detail_font, anchor="w",
                 )
 
 
