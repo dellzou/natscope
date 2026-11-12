@@ -236,14 +236,30 @@ class TestNoteTruthfulness(unittest.TestCase):
             filtering_behavior=FILT_EIF,
         )
         note = viz.build_matrix(nat).note
-        self.assertIn("映射行为未测得", note)
-        self.assertIn("反推", note)
-        self.assertNotIn("均已测得", note)
-        # 反推链是 classic_type -> mapping，不是 filtering -> mapping，
-        # 文案必须指向真实存在的那条路径
-        self.assertIn("传统类型", note)
-        # 列（过滤行为）是实测的，必须让用户知道该信哪一维
-        self.assertIn("列由实测", note)
+        self.assertIn(
+            "映射行为未测得",
+            note,
+            "单台服务器场景下 mapping 仍是 unknown；note 必须如实说明它没测到，"
+            "否则会和同一份报告页脚的警告「映射行为未能测量」直接矛盾",
+        )
+        self.assertNotIn(
+            "均已测得",
+            note,
+            "mapping 是反推来的，说「均已测得」就是陈述一件不成立的事，"
+            "而且假话紧贴图形、真话被埋在页脚，用户会先信错的那句",
+        )
+        self.assertIn(
+            "传统类型",
+            note,
+            "反推链是 classic_type → mapping（viz 内），不是 filtering → mapping；"
+            "写错来源会把排障的人引向一条不存在的代码路径",
+        )
+        self.assertIn(
+            "列由实测",
+            note,
+            "列（过滤行为）是实测的，必须让用户知道该信哪一维；"
+            "只说「反推」会让人以为整张矩阵都不可信",
+        )
 
     def test_note_never_claims_measured_for_inferred_behaviour(self):
         cases = {
@@ -260,8 +276,18 @@ class TestNoteTruthfulness(unittest.TestCase):
         for label, nat in cases.items():
             with self.subTest(label):
                 note = viz.build_matrix(nat).note
-                self.assertNotIn("均已测得", note, f"{label}：note 不许说「均已测得」")
-                self.assertIn("反推", note, f"{label}：必须说明是反推来的")
+                self.assertNotIn(
+                    "均已测得",
+                    note,
+                    f"{label}：反推值不是实测值；说「均已测得」会让用户以为"
+                    "两项都测到了，而实际有一项只是从类型名推出来的",
+                )
+                self.assertIn(
+                    "反推",
+                    note,
+                    f"{label}：必须点明结论有推断成分；"
+                    "否则用户会把它当成实测结果去排障",
+                )
 
     def test_fully_measured_note_still_says_measured(self):
         """别为了修假话把真话也改掉（过度收紧同样是失真）。"""
@@ -270,7 +296,12 @@ class TestNoteTruthfulness(unittest.TestCase):
             mapping_behavior=MAP_EIM,
             filtering_behavior=FILT_EIF,
         )
-        self.assertIn("均已测得", viz.build_matrix(nat).note)
+        self.assertIn(
+            "均已测得",
+            viz.build_matrix(nat).note,
+            "两个行为字段都是实测值时仍须说「均已测得」；"
+            "为了保守而一律说「反推」，会让正常报告也显得不可靠",
+        )
 
     def test_note_has_no_status_marker(self):
         """状态标记（「·反推」）归行头，正文只负责说明——避免两处都标反推。"""
@@ -280,8 +311,46 @@ class TestNoteTruthfulness(unittest.TestCase):
             filtering_behavior=FILT_EIF,
         )
         note = viz.build_matrix(nat).note
-        self.assertNotIn("（反推）", note)
-        self.assertNotIn("·反推", note)
+        self.assertNotIn(
+            "（反推）",
+            note,
+            "状态标记留给 v1.2 的行头；正文再标一次会让同一件事出现在两个位置",
+        )
+        self.assertNotIn("·反推", note, "同上：标记属于行头，不属于说明文字")
+
+    def test_symmetric_unsplit_keeps_its_own_note(self):
+        """对称型未细分：两行是「两种可能」，不能被反推文案盖掉。
+
+        回归用例。历史上 note 有两处赋值，后一处无条件覆盖前一处，于是这句
+        文案永远执行不到，覆盖后还把它说成「由传统类型反推出来的某一行」——
+        而实际情况是 ADM / APDM 两行都可能。QA 用
+        ``classic=symmetric + mapping=unknown + filtering=apdf`` 复现。
+        """
+        for filtering in ("unknown", FILT_EIF, FILT_ADF, FILT_APDF):
+            with self.subTest(filtering=filtering):
+                nat = NatResult(
+                    classic_type=CLASSIC_SYMMETRIC,
+                    mapping_behavior=MAP_UNKNOWN,
+                    filtering_behavior=filtering,
+                )
+                mat = viz.build_matrix(nat)
+                self.assertIn(
+                    "两行同一列均可能",
+                    mat.note,
+                    "对称型未细分时高亮的是 ADM / APDM 两行，"
+                    "note 必须说明这是「两种可能」；说成「反推出来的行」等于"
+                    "把不确定性讲成了确定结论",
+                )
+                self.assertNotIn(
+                    "由传统类型反推",
+                    mat.note,
+                    "对称型的行不是反推出来的单行，而是两行并列的两种可能",
+                )
+                self.assertEqual(
+                    {c.row for c in mat.highlighted()},
+                    {MAP_ADM, MAP_APDM},
+                    "两行都应高亮；只亮一行会让人以为已经分清了 ADM / APDM",
+                )
 
 
 class TestSpectrum(unittest.TestCase):

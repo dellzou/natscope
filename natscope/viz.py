@@ -346,16 +346,13 @@ def build_matrix(nat: NatResult) -> Matrix:
 
     if mapping in (MAP_ADM, MAP_APDM):
         rows = [mapping]
-        note = ""
     elif mapping == "" and classic == CLASSIC_SYMMETRIC:
         # 只知是对称型、不知是 ADM 还是 APDM：两行同一列都可能
         rows = [MAP_ADM, MAP_APDM]
-        note = "对称型：映射行为未细分到 ADM / APDM，两行同一列均可能。"
     elif mapping == MAP_EIM:
         rows = [MAP_EIM]
     else:
         rows = []
-        note = "映射行为不可测（可用服务器不足），行为矩阵没有确定位置。"
 
     grid: list[tuple[Cell, ...]] = []
     for row in MATRIX_ROWS:
@@ -372,30 +369,50 @@ def build_matrix(nat: NatResult) -> Matrix:
             line.append(make(row, col, state))
         grid.append(tuple(line))
 
-    # note 里的「均已测得」只能基于**实测字段**判断。viz 的 mapping / filtering
-    # 可能是从 classic_type 反推来的（_MAPPING_FROM_CLASSIC / _FILTERING_FROM_CLASSIC），
-    # 拿反推值说"已测得"就是在陈述一句不成立的事实——而且它会和同一份报告页脚的
+    # ---- note：只在**一个**地方按「特例在前、通用在后」赋值 ----
+    #
+    # 这里曾经在两处各赋一次（rows 构造处一处、这里一处），后写的那次会把
+    # 前写的整个盖住：于是「对称型未细分」的文案永远执行不到，而且覆盖后还
+    # 说错了事实（两行是「两种可能」，不是「反推出来的某一行」）。死代码本身
+    # 不可怕，可怕的是「我们以为它会执行」——所以收敛成单一赋值点并按优先级
+    # 排好，任何一条分支都只可能被一个条件命中。
+    #
+    # 「均已测得」只能基于**实测字段**判断：viz 的 mapping / filtering 可能是
+    # 从 classic_type 反推来的（_MAPPING_FROM_CLASSIC / _FILTERING_FROM_CLASSIC），
+    # 拿反推值说"已测得"就是在陈述一句不成立的事实，还会和同一份报告页脚的
     # 警告（"映射行为未能测量"）直接打架：假话在图下方，真话被埋在页脚。
     #
-    # 反推链是 classic_type → mapping/filtering（两跳里的第二跳），
-    # 不存在"从 filtering 直接推 mapping"的路径，所以文案写「由传统类型反推」。
+    # 反推链是 classic_type → mapping/filtering（两跳里的第二跳），不存在
+    # "从 filtering 直接推 mapping"的路径，所以文案写「由传统类型反推」。
     # 状态标记（如行头的「·反推」）留给渲染层，正文只负责把事实说清楚。
     mapping_measured = nat.mapping_behavior in _MAPPINGS
     filtering_measured = nat.filtering_behavior in _FILTERINGS
-    if rows and filtering:
-        if mapping_measured and filtering_measured:
-            note = "映射与过滤行为均已测得，结论落在高亮格。"
-        elif filtering_measured:
-            # P0-2 兜底分支：classic 由过滤行为推出，mapping 仍是 unknown（真机可达）
-            note = "映射行为未测得，矩阵行由传统类型反推，列由实测过滤行为确定。"
-        elif mapping_measured:
-            note = "过滤行为未测得，矩阵列由传统类型反推，行由实测映射行为确定。"
-        else:
-            note = "映射与过滤行为均未测得，矩阵由传统类型反推定位。"
-    elif mapping == MAP_EIM:
-        # 措辞必须与类型谱的区间标签（spectrum_span().label）前半句逐字一致：
-        # 同一张图里两套说法会被读成「两个不同的状态」。
-        note = "锥型（三选一，无法细分）：过滤行为不可测，无法确认是完全 / 受限 / 端口受限锥型。"
+    if classic == CLASSIC_SYMMETRIC and not mapping_measured:
+        # 特例优先：两行是「两种可能」，不是「反推出来的某一行」
+        note = "对称型：映射行为未细分到 ADM / APDM，两行同一列均可能。"
+    elif not rows:
+        note = "映射行为不可测（可用服务器不足），行为矩阵没有确定位置。"
+    elif not filtering:
+        # 映射已测、过滤不可测：整行 related 已经把「候选」画出来了，
+        # 锥型行再加一句，其余（对称型已细分）不需要额外说明。
+        if mapping == MAP_EIM:
+            # 措辞必须与类型谱的区间标签（spectrum_span().label）前半句逐字一致：
+            # 同一张图里两套说法会被读成「两个不同的状态」。
+            note = (
+                "锥型（三选一，无法细分）：过滤行为不可测，"
+                "无法确认是完全 / 受限 / 端口受限锥型。"
+            )
+    elif mapping_measured and filtering_measured:
+        note = "映射与过滤行为均已测得，结论落在高亮格。"
+    elif filtering_measured:
+        # P0-2 兜底分支：classic 由过滤行为推出，mapping 仍是 unknown（真机可达）
+        note = "映射行为未测得，矩阵行由传统类型反推，列由实测过滤行为确定。"
+    elif mapping_measured:
+        # mapping 实测、filtering 反推：行是实测的，列才是推出来的
+        note = "过滤行为未测得，矩阵列由传统类型反推，行由实测映射行为确定。"
+    else:
+        # 两个字段都靠反推（如只记录 classic_type 的旧数据）
+        note = "映射与过滤行为均未测得，矩阵由传统类型反推定位。"
 
     return Matrix(rows=MATRIX_ROWS, cols=MATRIX_COLS, cells=tuple(grid), note=note)
 
