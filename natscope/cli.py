@@ -15,6 +15,7 @@ import time
 
 from . import __version__
 from .config import Config
+from .diag import get_logger, save_diagnostics, setup as setup_logging
 from .gateway import probe_gateway
 from .nat import NatDetector
 from .report import ReportContext, default_filename, save_image, save_text
@@ -33,8 +34,23 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--server", action="append", default=[], help="追加自定义 STUN 服务器，可多次")
     ap.add_argument("--timeout", type=float, default=1.5, help="STUN 请求超时（秒）")
     ap.add_argument("--quiet", action="store_true", help="只输出结论")
+    ap.add_argument("--verbose", action="store_true", help="日志级别设为 DEBUG")
+    ap.add_argument("--diag", nargs="?", const="", default=None,
+                    help="导出诊断包（环境 + 最近日志），可指定路径")
     ap.add_argument("--version", action="version", version=f"NatScope {__version__}")
     args = ap.parse_args(argv)
+
+    setup_logging("DEBUG" if args.verbose else "INFO")
+    log = get_logger("cli")
+    log.info("启动 natscope %s（timeout=%.2f）", __version__, args.timeout)
+
+    if args.diag is not None:
+        path = args.diag or default_filename("NatScope诊断", "txt")
+        if save_diagnostics(path):
+            print(f"诊断包已保存: {path}")
+        else:
+            print(f"诊断包保存失败: {path}", file=sys.stderr)
+        return 0
 
     cfg = Config.load()
     for s in args.server:
@@ -49,6 +65,8 @@ def main(argv: list[str] | None = None) -> int:
     t0 = time.time()
     results = probe_servers(servers, timeout=min(args.timeout, 1.2), retry_timeout=args.timeout)
     summary = ProbeSummary(results)
+    log.info("探测完成 %.1fs：可用 %d / 共 %d",
+             time.time() - t0, len(summary.usable), len(results))
     if not args.quiet:
         print(
             f"探测完成 {time.time() - t0:.1f}s：优选 {len(summary.preferred)} / "
@@ -59,6 +77,8 @@ def main(argv: list[str] | None = None) -> int:
 
     detector = NatDetector(timeout=args.timeout, log=None if args.quiet else print)
     nat = detector.run(results)
+    log.info("结论 %s / mapping=%s / filtering=%s",
+             nat.classic_type, nat.mapping_behavior, nat.filtering_behavior)
 
     gw = None if args.no_gateway else probe_gateway(nat.local_ip)
 

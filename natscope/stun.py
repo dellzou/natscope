@@ -15,6 +15,7 @@ import socket
 import struct
 import time
 from dataclasses import dataclass, field
+from enum import Enum
 
 MAGIC_COOKIE = 0x2112A442
 
@@ -53,6 +54,29 @@ ATTR_NAMES = {
 
 class StunError(Exception):
     """STUN 报文非法或不可解析。"""
+
+
+class ErrorKind(str, Enum):
+    """``BindingResult.error_kind`` 的取值。
+
+    判定逻辑**只认这个枚举**，不认 ``error`` 里那句给人看的描述——否则哪天
+    把 "timeout" 改成 "超时(1.2s)"，APDF 分支就会永久失效且无人察觉。
+    继承 ``str`` 是为了和 v1.0 里那些字符串常量保持可比较。
+    """
+
+    TIMEOUT = "timeout"
+    DNS = "dns"
+    OS = "oserror"
+    NON_STUN = "non_stun"
+    UNKNOWN = "unknown"
+
+
+# 兼容旧调用点（历史常量，值与 ErrorKind 一致）
+ERR_TIMEOUT = ErrorKind.TIMEOUT.value
+ERR_DNS = ErrorKind.DNS.value
+ERR_OSERROR = ErrorKind.OS.value
+ERR_STUN = ErrorKind.NON_STUN.value
+ERR_UNKNOWN = ErrorKind.UNKNOWN.value
 
 
 @dataclass
@@ -97,7 +121,21 @@ class StunMessage:
         return None
 
     def other_address(self) -> tuple[str, int] | None:
+        """OTHER-ADDRESS；RFC 3489 时代的服务器只给 CHANGED-ADDRESS，一并兼容。"""
+        return self.other or self.changed_address()
+
+    @property
+    def other(self) -> tuple[str, int] | None:
         v = self.attrs.get(ATTR_OTHER_ADDRESS)
+        return _decode_address(v) if v else None
+
+    def changed_address(self) -> tuple[str, int] | None:
+        """CHANGED-ADDRESS（0x0005）：RFC 3489 里与 OTHER-ADDRESS 等价的字段。
+
+        现网 91 台里 12 台给 OTHER-ADDRESS、另有 38 台只给 CHANGED-ADDRESS，
+        只认前者会把一半可用候选挡在外面。
+        """
+        v = self.attrs.get(ATTR_CHANGED_ADDRESS)
         return _decode_address(v) if v else None
 
     def response_origin(self) -> tuple[str, int] | None:
@@ -105,14 +143,27 @@ class StunMessage:
         return _decode_address(v) if v else None
 
     def supports_change_request(self) -> bool:
-        """能否根据响应判断服务器支持 CHANGE-REQUEST。
+        """能否根据响应判断服务器支持 CHANGE-REQUEST。"""
+        return _has_change_request_support(self)
 
-        RFC 5780 服务器会在响应里带 RESPONSE-ORIGIN 与 OTHER-ADDRESS。
-        返回 420 说明不支持。
-        """
-        if self.error_code == 420:
-            return False
-        return ATTR_OTHER_ADDRESS in self.attrs
+
+def _has_change_request_support(msg: "StunMessage") -> bool:
+    """CHANGE-REQUEST 能力判据（**唯一的判定点**，改判据只改这里）。
+
+    420（Unknown Attribute）明确表示不支持；否则只要响应里声明了用于"另一个
+    地址/端口"的属性就算候选：
+
+    * ``OTHER-ADDRESS``(0x802C)   —— RFC 5780
+    * ``CHANGED-ADDRESS``(0x0005) —— RFC 3489 等价字段
+
+    注意这只是**属性层面的候选**，不代表服务器真的会回包。实际测量前应由
+    ``natscope.nat.NatDetector`` 用「预热一次性 socket」做能力验证：现网 50 台
+    声明支持的服务器里有 13 台根本不响应 CHANGE-REQUEST，直接用会得出假的
+    「端口受限」结论。
+    """
+    if msg.error_code == 420:
+        return False
+    return ATTR_OTHER_ADDRESS in msg.attrs or ATTR_CHANGED_ADDRESS in msg.attrs
 
 
 def _decode_address(value: bytes) -> tuple[str, int] | None:
@@ -201,18 +252,11 @@ def parse_message(data: bytes) -> StunMessage:
             raise StunError(
                 f"属性 0x{atype:04X} 越界：声明 {alen} 字节，剩余仅 {len(body) - off} 字节"
             )
-        attrs[atype] = body[off : off + alen]
+        # 重复属性取**第一个**：RFC 5389 对 COMPREHENSION-REQUIRED 属性的通行
+        # 做法，也让被中间设备追加在后面的"影子属性"无法覆盖服务器真正给的值
+        attrs.setdefault(atype, body[off : off + alen])
         off += (alen + 3) & ~3
     return StunMessage(msg_type=msg_type, transaction_id=tid, attrs=attrs, raw=data)
-
-
-#: BindingResult.error_kind 的取值。判定逻辑**只认这几个枚举值**，不认
-#: error 里那句给人看的描述——否则哪天把 "timeout" 改成 "超时(1.2s)"，
-#: APDF 分支就会永久失效且无人察觉。
-ERR_TIMEOUT = "timeout"
-ERR_OSERROR = "oserror"
-ERR_STUN = "stun"
-ERR_UNKNOWN = "unknown"
 
 
 @dataclass
@@ -248,19 +292,23 @@ def _is_ipv6_literal(host: str) -> bool:
         return False
 
 
-def resolve(host: str, port: int) -> tuple[str, int]:
-    """解析主机名，**只返回 IPv4**。失败抛 OSError。
+def resolve(host: str, port: int, family: int = socket.AF_INET) -> tuple[str, int]:
+    """解析主机名，默认只返回 IPv4。失败抛 OSError（并带准确原因）。
 
-    本工具全程复用同一个 IPv4 UDP socket（映射行为检测的前提），因此暂时
-    不支持 IPv6 服务器。旧实现把这种情况报成"DNS 解析失败"，会把用户引到
-    "换个 DNS"的错误方向；这里区分开：IPv6 字面量给出明确的"暂不支持"。
+    本工具的映射行为检测全程复用同一个 IPv4 UDP socket，因此 ``family`` 默认
+    ``AF_INET``；传 ``AF_INET6`` 时只支持 IPv6 字面量（不做 AAAA 查询之外的
+    额外处理，供将来扩展）。旧实现把"IPv6 地址族不支持"报成"DNS 解析失败"，
+    会把用户引到"换个 DNS"的错误方向。
     """
     if _is_ipv6_literal(host):
-        raise OSError(f"暂不支持 IPv6 STUN 服务器：{host}（当前仅支持 IPv4）")
+        literal = host.strip().strip("[]")
+        if family != socket.AF_INET6:
+            raise OSError(f"暂不支持 IPv6 STUN 服务器：{host}（当前仅支持 IPv4）")
+        return literal, port  # 字面量不需要查 DNS
     try:
-        infos = socket.getaddrinfo(host, port, socket.AF_INET, socket.SOCK_DGRAM)
+        infos = socket.getaddrinfo(host, port, family, socket.SOCK_DGRAM)
     except socket.gaierror as exc:
-        if _has_ipv6_address(host):
+        if family == socket.AF_INET and _has_ipv6_address(host):
             raise OSError(
                 f"{host} 只有 IPv6 地址（AAAA），当前仅支持 IPv4 STUN 服务器"
             ) from exc
@@ -326,17 +374,36 @@ def binding_transaction(
                 return res
         except socket.timeout:
             last_err = "timeout"
-            last_kind = ERR_TIMEOUT
+            last_kind = ErrorKind.TIMEOUT.value
         except OSError as exc:
             last_err = str(exc)
-            last_kind = ERR_OSERROR
+            last_kind = ErrorKind.OS.value
         except StunError as exc:
             last_err = f"非法报文: {exc}"
-            last_kind = ERR_STUN
+            last_kind = ErrorKind.NON_STUN.value
 
     res.error = last_err or "unknown"
-    res.error_kind = last_kind or ERR_UNKNOWN
+    res.error_kind = last_kind or ErrorKind.UNKNOWN.value
     return res
+
+
+def binding_to(ip: str, port: int, timeout: float = 1.5) -> BindingResult:
+    """向**已解析**的 ``ip:port`` 发一次 Binding 事务（不再查 DNS）。
+
+    给"解析一次、复用结果"的调用方用：既省掉每台服务器一次多余的 DNS 查询，
+    也保证上层拿到的 ``ip`` 与实际发包的目的地址是同一个 A 记录。
+    """
+    res = BindingResult()
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.bind(("", 0))
+        return binding_transaction(sock, (ip, port), timeout=timeout)
+    except OSError as exc:
+        res.error = str(exc)
+        res.error_kind = ErrorKind.OS.value
+        return res
+    finally:
+        sock.close()
 
 
 def probe_server(host: str, port: int, timeout: float = 1.5) -> BindingResult:
@@ -346,13 +413,6 @@ def probe_server(host: str, port: int, timeout: float = 1.5) -> BindingResult:
         addr = resolve(host, port)
     except OSError as exc:
         res.error = str(exc)
+        res.error_kind = ErrorKind.DNS.value
         return res
-    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
-    try:
-        sock.bind(("", 0))
-        return binding_transaction(sock, addr, timeout=timeout)
-    except OSError as exc:
-        res.error = str(exc)
-        return res
-    finally:
-        sock.close()
+    return binding_to(addr[0], addr[1], timeout=timeout)

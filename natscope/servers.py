@@ -159,7 +159,11 @@ class ProbeResult:
 
 
 def parse_server(text: str) -> StunServer:
-    """解析 "host"、"host:port"、"stun:host:port"、"stun://host:port"。"""
+    """解析 "host"、"host:port"、"stun:host:port"、"stun://host:port"、"[ipv6]:port"。
+
+    解析失败一律抛 ``ValueError``——静默接受畸形输入只会让用户拿到一台
+    "永远不可用"的服务器，却看不出是自己写错了。
+    """
     s = text.strip()
     if not s:
         raise ValueError("服务器地址为空")
@@ -170,18 +174,37 @@ def parse_server(text: str) -> StunServer:
     s = s.strip("/").strip()
     if not s:
         raise ValueError(f"服务器地址无效: {text!r}")
+    if any(ch.isspace() for ch in s):
+        raise ValueError(f"服务器地址不能包含空白字符: {text!r}")
+
     if s.startswith("["):  # [ipv6]:port
-        host, _, rest = s.partition("]")
+        host, sep, rest = s.partition("]")
+        if not sep:
+            raise ValueError(f"IPv6 地址缺少右括号: {text!r}")
         host = host[1:]
         port = 3478
-        if rest.startswith(":") and rest[1:].isdigit():
-            port = int(rest[1:])
+        if rest:
+            if not rest.startswith(":"):
+                raise ValueError(f"IPv6 地址后的端口格式无效: {text!r}")
+            digits = rest[1:]
+            if not digits.isdigit():
+                raise ValueError(f"端口无效: {text!r}")
+            port = int(digits)
+        if not host:
+            raise ValueError(f"主机名为空: {text!r}")
+        if not (1 <= port <= 65535):
+            raise ValueError(f"端口越界: {port}")
         return StunServer(host, port)
+
     if s.count(":") == 1:
         host, _, p = s.partition(":")
         if not p.isdigit():
             raise ValueError(f"端口无效: {text!r}")
         port = int(p)
+    elif s.count(":") > 1:
+        # 裸 IPv6 字面量（不带方括号）无法与 host:port 区分，直接拒绝，
+        # 要求用户写成 [ipv6]:port
+        raise ValueError(f"IPv6 地址请写成 [地址]:端口 的形式: {text!r}")
     else:
         host, port = s, 3478
     if not (1 <= port <= 65535):
@@ -197,9 +220,13 @@ def _probe_one(server: StunServer, timeout: float) -> ProbeResult:
         ip, port = stun.resolve(server.host, server.port)
     except OSError as exc:
         res.error = str(exc)
+        res.error_kind = stun.ErrorKind.DNS.value
         return res
     res.ip = ip
-    r = stun.probe_server(server.host, server.port, timeout=timeout)
+    # 必须把**已解析出来的 ip** 交给探测，让它只解析一次：
+    # 一是省掉每台一份多余的 DNS 查询（90 台 = 90 次），二是保证 nat.py 里
+    # "同一目的 IP" 的前提成立——两次解析拿到不同 A 记录会破坏映射比对。
+    r = stun.binding_to(ip, port, timeout=timeout)
     if r.ok:
         res.ok = True
         res.rtt_ms = r.rtt_ms
@@ -207,7 +234,23 @@ def _probe_one(server: StunServer, timeout: float) -> ProbeResult:
         res.supports_rfc5780 = r.supports_rfc5780
     else:
         res.error = r.error or (r.error_reason or f"错误码 {r.error_code}")
+        res.error_kind = r.error_kind
     return res
+
+
+def _probe_one_safe(server: StunServer, timeout: float) -> ProbeResult:
+    """单台服务器的探测绝不能把整轮探测带崩。
+
+    之前 `pool.map` 里任一 `_probe_one` 抛异常，整个 `probe_servers` 就 traceback
+    退出（CLI 直接崩、GUI 把已算完的结果丢掉）。一台畸形服务器不该有这种权力。
+    """
+    try:
+        return _probe_one(server, timeout)
+    except Exception as exc:  # noqa: BLE001 - 单点故障必须降级
+        res = ProbeResult(server=server)
+        res.error = f"探测异常：{type(exc).__name__}: {exc}"
+        res.error_kind = stun.ErrorKind.UNKNOWN.value
+        return res
 
 
 def probe_servers(
@@ -228,7 +271,7 @@ def probe_servers(
     done = 0
 
     with ThreadPoolExecutor(max_workers=min(workers, total)) as pool:
-        for r in pool.map(lambda s: _probe_one(s, timeout), servers):
+        for r in pool.map(lambda s: _probe_one_safe(s, timeout), servers):
             results.append(r)
             done += 1
             if progress:
@@ -237,7 +280,7 @@ def probe_servers(
     failed = [r for r in results if not r.ok]
     if failed:
         with ThreadPoolExecutor(max_workers=min(workers, len(failed))) as pool:
-            for new in pool.map(lambda s: _probe_one(s.server, retry_timeout), failed):
+            for new in pool.map(lambda s: _probe_one_safe(s.server, retry_timeout), failed):
                 if new.ok:
                     idx = results.index(next(r for r in results if r.server == new.server))
                     results[idx] = new

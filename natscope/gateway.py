@@ -7,11 +7,14 @@
 
 from __future__ import annotations
 
+import ctypes
 import http.client
 import re
 import socket
 import struct
 import subprocess
+import sys
+import time
 import urllib.parse
 import xml.etree.ElementTree as ET
 from dataclasses import dataclass, field
@@ -73,14 +76,120 @@ class GatewayReport:
 # --------------------------------------------------------------------------
 # 默认网关
 # --------------------------------------------------------------------------
+#
+# 为什么优先走 ctypes 而不是 `route print` / `ipconfig`：
+# PyInstaller 单文件 exe 每次派生子进程（且带创建窗口标志）都是杀软启发式的
+# 加分项，而这个函数在每次检测里会被调用。GetBestRoute2 是 IP Helper 的公开
+# API，毫秒级、无子进程。两套旧实现保留作为 fallback：ctypes 结构体布局一旦在
+# 某个系统版本上不符预期（我们会显式校验 sizeof），就退回子进程路径。
+
+
+class _SOCKADDR_INET(ctypes.Structure):
+    """SOCKADDR_IN / SOCKADDR_IN6 的联合体，统一按 28 字节、align 4 表示。
+
+    IPv4 只读 ``family`` 与 ``addr32``（= sin_addr），偏移与 sockaddr_in 一致。
+    """
+
+    _fields_ = [
+        ("family", ctypes.c_ushort),
+        ("port", ctypes.c_ushort),
+        ("addr32", ctypes.c_uint32),
+        ("sin_zero", ctypes.c_ubyte * 8),
+        ("in6_tail", ctypes.c_ubyte * 12),
+    ]
+
+
+class _IP_ADDRESS_PREFIX(ctypes.Structure):
+    _fields_ = [("Prefix", _SOCKADDR_INET), ("PrefixLength", ctypes.c_ubyte)]
+
+
+class _MIB_IPFORWARD_ROW2(ctypes.Structure):
+    _fields_ = [
+        ("InterfaceLuid", ctypes.c_uint64),
+        ("InterfaceIndex", ctypes.c_uint32),
+        ("DestinationPrefix", _IP_ADDRESS_PREFIX),
+        ("NextHop", _SOCKADDR_INET),
+        ("SitePrefixLength", ctypes.c_ubyte),
+        ("ValidLifetime", ctypes.c_uint32),
+        ("PreferredLifetime", ctypes.c_uint32),
+        ("Metric", ctypes.c_uint32),
+        ("Protocol", ctypes.c_int),
+        ("Loopback", ctypes.c_ubyte),
+        ("AutoconfigureAddress", ctypes.c_ubyte),
+        ("Publish", ctypes.c_ubyte),
+        ("Immortal", ctypes.c_ubyte),
+        ("Age", ctypes.c_uint32),
+        ("Origin", ctypes.c_int),
+    ]
+
+
+def _sinet_to_ipv4(sa: _SOCKADDR_INET) -> str:
+    if sa.family != socket.AF_INET:
+        return ""
+    raw = sa.addr32.to_bytes(4, "little")
+    return ".".join(str(b) for b in raw)
+
+
+def _route_via_iphelper() -> tuple[str, str]:
+    """用 GetBestRoute2 取 (默认网关, 出口源 IP)；失败返回空串对。
+
+    这是"0 次 subprocess"路径。返回值都会做格式校验，布局不对就自然落到
+    fallback，不会把垃圾字节当网关用。
+    """
+    if sys.platform != "win32":
+        return "", ""
+    if ctypes.sizeof(_MIB_IPFORWARD_ROW2) != 104 or ctypes.sizeof(_IP_ADDRESS_PREFIX) != 32:
+        return "", ""
+    try:
+        iphlpapi = ctypes.WinDLL("iphlpapi.dll")
+        fn = iphlpapi.GetBestRoute2
+    except (OSError, AttributeError):
+        return "", ""
+
+    dest = _SOCKADDR_INET()
+    dest.family = socket.AF_INET
+    dest.addr32 = 0  # 0.0.0.0
+    row = _MIB_IPFORWARD_ROW2()
+    best_src = _SOCKADDR_INET()
+    fn.argtypes = [
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.POINTER(_SOCKADDR_INET),
+        ctypes.c_uint32,
+        ctypes.POINTER(_MIB_IPFORWARD_ROW2),
+        ctypes.POINTER(_SOCKADDR_INET),
+    ]
+    fn.restype = ctypes.c_uint32  # NETIO_STATUS：0 = NO_ERROR
+    status = fn(None, 0, None, ctypes.byref(dest), 0, ctypes.byref(row), ctypes.byref(best_src))
+    if status != 0:
+        return "", ""
+    gateway = _sinet_to_ipv4(row.NextHop)
+    source = _sinet_to_ipv4(best_src)
+    if not _is_ipv4(gateway) or gateway in ("0.0.0.0", "255.255.255.255"):
+        gateway = ""
+    if not _is_ipv4(source) or source.startswith("0."):
+        source = ""
+    return gateway, source
+
+
+def _outbound_source_ip() -> str:
+    """本机访问外网时使用的源 IP（UDP connect 不会真的发包）。"""
+    sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    try:
+        sock.connect(("8.8.8.8", 80))
+        return sock.getsockname()[0]
+    except OSError:
+        return ""
+    finally:
+        sock.close()
 
 
 def default_gateway() -> str:
-    """获取 IPv4 默认网关。
-
-    优先用 `route print`（输出几乎全为数字与英文，不受系统语言影响），
-    失败再解析 ipconfig，最后回退到本地网段的 .1 / .254。
-    """
+    """获取 IPv4 默认网关（优先无子进程路径）。"""
+    gw, _ = _route_via_iphelper()
+    if gw:
+        return gw
     gw = _gateway_from_route()
     if gw:
         return gw
@@ -129,6 +238,13 @@ def _gateway_from_ipconfig() -> str:
     return ""
 
 
+def _from_gateway(addr, gateway_ip: str) -> bool:
+    """响应是否真的来自网关（NAT-PMP / PCP 是明文 UDP，谁都可能抢答）。"""
+    if not gateway_ip:
+        return True  # 没有网关地址时无从校验，交给上层判断
+    return bool(addr) and addr[0] == gateway_ip
+
+
 def _is_ipv4(s: str) -> bool:
     parts = s.split(".")
     if len(parts) != 4:
@@ -152,8 +268,16 @@ def guess_gateways(local_ip: str) -> list[str]:
 # --------------------------------------------------------------------------
 
 
-def _ssdp_discover(timeout: float = UPNP_TIMEOUT) -> list[str]:
-    """SSDP M-SEARCH，返回所有网关的 LOCATION。"""
+def _ssdp_discover(timeout: float = UPNP_TIMEOUT, source_ip: str = "") -> list[str]:
+    """SSDP M-SEARCH，返回所有网关的 LOCATION。
+
+    多网卡机器（本机就有 VMware / Hyper-V 虚拟网段）上，不绑定出口接口的组播
+    会从错误的那块网卡发出去，网关永远收不到 → 误判"未发现 UPnP"。这里把
+    socket 绑到默认路由的源 IP，并把 IP_MULTICAST_IF 指向同一地址。
+
+    超时用 ``time.monotonic()`` 截止：旧实现只在收到包时 ``deadline -= 0.1``，
+    收不到包就变成"每个 0.5s 再试 2s"，实际耗时远超标称值。
+    """
     locations: list[str] = []
     msg = (
         "M-SEARCH * HTTP/1.1\r\n"
@@ -171,14 +295,29 @@ def _ssdp_discover(timeout: float = UPNP_TIMEOUT) -> list[str]:
             sock.setsockopt(socket.IPPROTO_IP, socket.IP_MULTICAST_TTL, 2)
         except OSError:
             pass
-        sock.settimeout(timeout)
+        if source_ip and _is_ipv4(source_ip):
+            try:
+                sock.bind((source_ip, 0))
+            except OSError:
+                pass
+            try:
+                sock.setsockopt(
+                    socket.IPPROTO_IP, socket.IP_MULTICAST_IF, socket.inet_aton(source_ip)
+                )
+            except OSError:
+                pass
         sock.sendto(msg, SSDP_ADDR)
-        deadline = timeout
-        while deadline > 0:
+
+        deadline = time.monotonic() + timeout
+        while True:
+            remain = deadline - time.monotonic()
+            if remain <= 0:
+                break
+            sock.settimeout(min(remain, 0.5))
             try:
                 data, _ = sock.recvfrom(4096)
             except socket.timeout:
-                break
+                continue
             text = data.decode("utf-8", "replace")
             if not text.upper().startswith("HTTP/1.1 200"):
                 continue
@@ -188,8 +327,6 @@ def _ssdp_discover(timeout: float = UPNP_TIMEOUT) -> list[str]:
                     if loc and loc not in locations:
                         locations.append(loc)
                     break
-            deadline -= 0.1
-            sock.settimeout(0.5)
     except OSError:
         pass
     finally:
@@ -304,7 +441,7 @@ def _soap_get_external_ip(control_url: str, service_type: str) -> tuple[bool, st
 
 def probe_upnp(gateway_ip: str, timeout: float = UPNP_TIMEOUT) -> Capability:
     cap = Capability("UPnP-IGD")
-    locations = _ssdp_discover(timeout)
+    locations = _ssdp_discover(timeout, source_ip=_outbound_source_ip())
     if not locations:
         cap.state = "absent"
         cap.detail = "SSDP 未发现 IGD 设备"
@@ -359,7 +496,11 @@ def probe_natpmp(gateway_ip: str, timeout: float = 1.5) -> Capability:
     try:
         sock.settimeout(timeout)
         sock.sendto(req, (gateway_ip, PMP_PORT))
-        data, _ = sock.recvfrom(64)
+        data, addr = sock.recvfrom(64)
+        if not _from_gateway(addr, gateway_ip):
+            cap.state = "absent"
+            cap.detail = f"响应来源 {addr[0]} 不是网关，已忽略（可能是伪造应答）"
+            return cap
     except socket.timeout:
         cap.state = "absent"
         cap.detail = "网关 5351 端口无响应"
@@ -418,7 +559,11 @@ def probe_pcp(gateway_ip: str, timeout: float = 1.5) -> Capability:
     try:
         sock.settimeout(timeout)
         sock.sendto(req, (gateway_ip, PMP_PORT))
-        data, _ = sock.recvfrom(128)
+        data, addr = sock.recvfrom(128)
+        if not _from_gateway(addr, gateway_ip):
+            cap.state = "absent"
+            cap.detail = f"响应来源 {addr[0]} 不是网关，已忽略（可能是伪造应答）"
+            return cap
     except socket.timeout:
         cap.state = "absent"
         cap.detail = "网关 5351 端口无响应（PCP 与 NAT-PMP 共用端口）"

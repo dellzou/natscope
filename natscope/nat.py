@@ -18,12 +18,29 @@
 
 from __future__ import annotations
 
+import ipaddress
 import socket
 import time
 from dataclasses import dataclass, field
 
 from . import stun
 from .servers import ProbeResult, StunServer
+
+# ---- 过滤行为测量参数（阶段 2） ----
+#: 单次 CHANGE-REQUEST 的超时（秒）
+FILTER_TIMEOUT_S = 0.5
+#: 每个子测试最多发几包（服务器对连续 CHANGE-REQUEST 会限流，见 P2-17）
+FILTER_ATTEMPTS = 3
+#: 同一子测试两次重试之间的间隔（秒）
+FILTER_RETRY_GAP_S = 0.15
+#: Test II 与 Test III 之间的间隔（秒）：背靠背连发会被服务器丢弃
+FILTER_GAP_S = 0.25
+#: 整个过滤测量阶段的耗时上限（秒），含两次子测试与重试
+FILTER_BUDGET_S = 3.0
+#: 能力诊断最多试几台服务器
+FILTER_CAP_CANDIDATES = 3
+#: 能力诊断用的超时（秒）
+FILTER_CAP_TIMEOUT_S = 0.8
 
 # ---- 传统四类型 ----
 CLASSIC_BLOCKED = "blocked"
@@ -225,6 +242,40 @@ def local_outbound_ip() -> tuple[str, int]:
     return ip, 0
 
 
+#: 不能当作"公网采样目标"的网段。
+#: 注意只列真正的私有/不可路由段——**不要**用 ``ipaddress.is_private``，
+#: 它在 3.13 里把 192.0.2.0/24、198.51.100.0/24、203.0.113.0/24 这些文档
+#: 保留段也算进去，会把测试夹具与某些真实服务器一起误杀。
+_NON_ROUTABLE_NETS = tuple(
+    ipaddress.ip_network(net)
+    for net in (
+        "0.0.0.0/8",
+        "10.0.0.0/8",
+        "100.64.0.0/10",  # CGNAT
+        "127.0.0.0/8",
+        "169.254.0.0/16",
+        "172.16.0.0/12",
+        "192.168.0.0/16",
+        "224.0.0.0/4",  # 组播
+        "255.255.255.255/32",
+        "::/128",
+        "::1/128",
+        "fc00::/7",
+        "fe80::/10",
+        "ff00::/8",
+    )
+)
+
+
+def _is_routable(ip: str) -> bool:
+    """该地址能否当作"公网采样目标"：排除私网 / 环回 / 链路本地 / CGNAT / 组播。"""
+    try:
+        addr = ipaddress.ip_address(ip)
+    except ValueError:
+        return False
+    return not any(addr in net for net in _NON_ROUTABLE_NETS if net.version == addr.version)
+
+
 def _mapping_mode(samples: list[MappingSample]) -> str:
     """根据样本推断映射行为。
 
@@ -233,9 +284,25 @@ def _mapping_mode(samples: list[MappingSample]) -> str:
       * 存在"只改目的端口"且端口跟着变 → APDM
       * 只存在"只改目的 IP"且端口变    → ADM
       * 变量无法分离（IP 与端口都变）  → 保守归为 APDM
+
+    **多 WAN 保护**：不同样本的公网出口 IP 不一致时（多 WAN / 负载均衡 / CGNAT
+    轮换），比较"映射端口是否相同"没有意义——那是出口不同造成的，不是 NAT 映射
+    行为。此时只保留样本数最多的那一个出口 IP 的样本再比对，避免把双线环境误判
+    成对称型（实测本机就是这样：OTHER-ADDRESS 走另一条 WAN，映射端口必然不同）。
     """
     if len(samples) < 2:
         return MAP_UNKNOWN
+
+    hosts = [s for s in samples if s.mapped_ip]
+    if len({s.mapped_ip for s in hosts}) > 1:
+        groups: dict[str, list[MappingSample]] = {}
+        for s in hosts:
+            groups.setdefault(s.mapped_ip, []).append(s)
+        # 取样本最多的出口；并列时取含首个样本（主服务器）的那个
+        keep_ip = max(groups, key=lambda ip: (len(groups[ip]), ip == samples[0].mapped_ip))
+        samples = groups[keep_ip]
+        if len(samples) < 2:
+            return MAP_UNKNOWN
 
     if len({s.mapped_port for s in samples}) == 1:
         return MAP_EIM
@@ -368,33 +435,30 @@ class NatDetector:
             res.samples.append(MappingSample(primary.ip, primary.server.port,
                                              mapped[0], mapped[1], primary.server.label))
 
-            # ---------- CHANGE-REQUEST：过滤行为 + Test II / III ----------
+            # ---------- 过滤行为测量（阶段 2：全新 socket，绝不预热） ----------
             #
-            # 【顺序不能动】这段必须排在**任何向 OTHER-ADDRESS 发包的代码之前**。
+            # 【顺序与通道都不能动】这段必须排在**任何向 OTHER-ADDRESS / CHANGED-
+            # ADDRESS 发包的代码之前**，而且必须跑在**新建的 socket** 上。
             #
-            # Test II 的判据是"回包源 IP 是否变成了另一个地址"，而服务器换源
-            # 地址后发来的那个地址，正是它 OTHER-ADDRESS 里宣告的地址。只要我
-            # 们事先朝那个 ip:port 发过哪怕一个 UDP 包，NAT 就会为它建好入站
-            # 许可（地址受限 / 端口受限型 NAT 都会），于是 Test II 的回包被放行，
-            # 判成 FILT_EIF → 报"完全锥型 / P2P 最佳"。这是一个会给出错误结论
-            # 的 bug：明明不放行陌生地址的 NAT，被自己的预热行为测成了全锥。
+            # Test II 的判据是"回包源 IP 是否变成了另一个地址"，而服务器换源地址
+            # 后发来的地址正是它宣告的那个 other 地址。只要我们事先朝那个 ip:port
+            # 发过哪怕一个 UDP 包，NAT 就会为它建好入站许可（地址受限 / 端口受限
+            # 型都会），Test II 的回包被放行 → 判成 EIF → "完全锥型 / P2P 最佳"。
             # 真机对照（stun.miwifi.com，各 5 次）：全新 socket 直接发 Change-IP
             # 5/5 超时；先向 OTHER-ADDRESS 发一个包再发同一请求 5/5 成功。
-            # 所以多目标映射采样（_other_address_probes 与随后的采样循环）只能
-            # 排在这段之后 —— 采样本身必然要朝目标发包，那是测量映射行为必需的，
-            # 但它不能再"替"过滤测试把门打开。
-            cr_server = self._pick_change_request_server(sock, usable, res)
+            cr_server = self._pick_change_request_server(usable)
             if cr_server is None:
-                res.add_step("Test II：Change IP+Port", "skip", "无服务器支持 CHANGE-REQUEST")
-                res.add_step("Test III：Change Port", "skip", "无服务器支持 CHANGE-REQUEST")
+                res.add_step("Test II：Change IP+Port", "skip", "无服务器声明支持 CHANGE-REQUEST")
+                res.add_step("Test III：Change Port", "skip", "无服务器声明支持 CHANGE-REQUEST")
                 res.filtering_behavior = FILT_UNKNOWN
                 res.warnings.append(
-                    "当前可用服务器均未响应 CHANGE-REQUEST，过滤行为与传统四类型无法直接测量"
+                    "当前可用服务器均未声明 OTHER-ADDRESS / CHANGED-ADDRESS，"
+                    "过滤行为与传统四类型无法直接测量"
                 )
             else:
                 res.change_request_supported = True
                 res.rfc5780_server = cr_server.server.label
-                self._filter_tests(sock, cr_server, res)
+                self._measure_filtering(cr_server, usable, res)
 
             # ---------- 多服务器映射采样（对称型 / 映射行为） ----------
             others = [s for s in usable[1:] if s.ip != primary.ip][: max_samples - 1]
@@ -472,6 +536,12 @@ class NatDetector:
         other = r.other if r.ok else None
         if not other or other == (primary.ip, primary.server.port):
             return out
+        if not _is_routable(other[0]):
+            # 实测：stun.freeswitch.org 给 10.10.0.62:443、stun.sonetel.com 给
+            # 172.31.9.136:3479（AWS 内网）。拿私网地址当采样目标只会白等 1.2s，
+            # 还会把"回包源地址"的预期带偏。
+            self.log(f"跳过非公网 OTHER-ADDRESS：{other[0]}:{other[1]}")
+            return out
         # OTHER-ADDRESS 可能是同 IP 不同端口（可测"只改端口"），
         # 也可能是另一个 IP（可测"只改 IP"），两种情况都作为额外样本
         out.append(
@@ -484,84 +554,171 @@ class NatDetector:
         )
         return out
 
-    def _pick_change_request_server(self, sock, usable, res: NatResult) -> ProbeResult | None:
-        """找一个真正实现了 CHANGE-REQUEST 的服务器。
+    def _pick_change_request_server(self, usable) -> ProbeResult | None:
+        """挑一台**声明**支持 CHANGE-REQUEST 的服务器（不发任何包）。
 
-        探测阶段已标记支持的优先使用；若一个都没有，再对最快的几台做一次实测，
-        以 420（Unknown Attribute）或缺少 OTHER-ADDRESS 作为不支持依据。
+        这里只看属性（``supports_rfc5780`` 由探测阶段填好），因此绝不会有
+        "顺手把 OTHER-ADDRESS 预热掉"的副作用。真能力验证放在
+        :meth:`_prove_change_request_capability`，只在需要区分 APDF 时触发。
         """
         known = [s for s in usable if s.supports_rfc5780]
-        if known:
-            return min(known, key=lambda s: s.rtt_ms)
+        if not known:
+            return None
+        return min(known, key=lambda s: s.rtt_ms)
 
-        for s in sorted(usable, key=lambda x: x.rtt_ms)[:5]:
-            r = self._binding(sock, s, 1.0)
-            # 420（Unknown Attribute）等错误应答在 binding_transaction 里都是
-            # ok=False，已由下面这一行统一跳过，不需要单独判 error_code
-            if not r.ok:
-                continue
-            if r.other:
-                return s
-        return None
+    # ---- 阶段 2：行为测量（全新 socket，绝不预热） ----
 
-    def _filter_tests(self, sock, srv: ProbeResult, res: NatResult) -> None:
-        """Test II / III：校验回包源地址确实改变，否则该测试无效。
+    def _measure_filtering(self, srv: ProbeResult, usable, res: NatResult) -> None:
+        """在**新建的 socket** 上测 Test II / III。
 
-        attempts=2：这两个测试此前是"裸发"的（服务器探测阶段反而有重试），
-        一次 UDP 丢包就会把结论降级一级（Full Cone → Restricted → Port
-        Restricted），误判方向还是"把好结果说成差结果"。重试一次即可覆盖
-        绝大多数偶发丢包，最坏耗时 2×1.2s/项。
+        为什么必须是新 socket：过滤表是按"本地 socket（内部端口）"记的。若复用
+        已经朝 OTHER-ADDRESS 发过包的 socket，Test II 的回包会被那张表的旧条目
+        放行，得到假的"完全锥型"。新 socket = 新内部端口 = 干净的过滤表。
         """
-        dst_ip, dst_port = srv.ip, srv.server.port
+        dst = (srv.ip, srv.server.port)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind(("", 0))
+            meas_port = sock.getsockname()[1]
+            self.log(f"过滤测量通道 本地端口 {meas_port}，目标 {dst[0]}:{dst[1]}")
+            # 必须先建映射：CHANGE-REQUEST 的回包要落到这条映射上
+            base = stun.binding_transaction(sock, dst, timeout=1.0)
+            if not base.ok:
+                res.add_step(
+                    "Test II：Change IP+Port", "skip",
+                    f"新建测量通道后无法建立映射：{base.error or '超时'}",
+                )
+                res.add_step("Test III：Change Port", "skip", "同上")
+                res.filtering_behavior = FILT_UNKNOWN
+                res.warnings.append("过滤测量建链失败，过滤行为标记为不可测")
+                return
 
-        # Test II：change IP + change Port
-        r2 = stun.binding_transaction(
-            sock, (dst_ip, dst_port), change_ip=True, change_port=True,
-            timeout=1.2, attempts=2,
-        )
-        ii_valid = r2.ok and r2.source is not None and r2.source[0] != dst_ip
-        if r2.ok and not ii_valid:
-            res.add_step(
-                "Test II：Change IP+Port",
-                "skip",
-                "服务器忽略 CHANGE-REQUEST（回包源地址未变），测试无效",
-            )
-        elif ii_valid:
-            res.add_step("Test II：Change IP+Port", "ok",
-                         f"收到来自 {r2.source[0]}:{r2.source[1]} 的响应")
-        else:
-            res.add_step("Test II：Change IP+Port", "fail", r2.error or "无响应")
+            deadline = time.perf_counter() + FILTER_BUDGET_S
+            r2 = self._change_request(sock, dst, True, True, deadline)
+            ii_valid = bool(r2.ok and r2.source and r2.source[0] != dst[0])
+            if r2.ok and not ii_valid:
+                res.add_step(
+                    "Test II：Change IP+Port", "skip",
+                    "服务器忽略 CHANGE-REQUEST（回包源地址未变），测试无效",
+                )
+            elif ii_valid:
+                res.add_step("Test II：Change IP+Port", "ok",
+                             f"收到来自 {r2.source[0]}:{r2.source[1]} 的响应")
+            else:
+                res.add_step("Test II：Change IP+Port", "fail", r2.error or "无响应")
 
-        # Test III：只改端口
-        r3 = stun.binding_transaction(
-            sock, (dst_ip, dst_port), change_ip=False, change_port=True,
-            timeout=1.2, attempts=2,
-        )
-        iii_valid = r3.ok and r3.source is not None and r3.source[1] != dst_port
-        if r3.ok and not iii_valid:
-            res.add_step(
-                "Test III：Change Port",
-                "skip",
-                "服务器忽略 CHANGE-REQUEST（回包端口未变），测试无效",
-            )
-        elif iii_valid:
-            res.add_step("Test III：Change Port", "ok",
-                         f"收到来自 {r3.source[0]}:{r3.source[1]} 的响应")
-        else:
-            res.add_step("Test III：Change Port", "fail", r3.error or "无响应")
+            # 服务器会对连续的 CHANGE-REQUEST 限流/丢包：实测"同 socket 连发 9 个"
+            # 全部超时、"每次单发"24/26 台成功。背靠背发会让 Test III 无辜超时，
+            # 把地址受限型推成端口受限型。
+            time.sleep(FILTER_GAP_S)
+
+            r3 = self._change_request(sock, dst, False, True, deadline)
+            iii_valid = bool(r3.ok and r3.source and r3.source[1] != dst[1])
+            if r3.ok and not iii_valid:
+                res.add_step(
+                    "Test III：Change Port", "skip",
+                    "服务器忽略 CHANGE-REQUEST（回包端口未变），测试无效",
+                )
+            elif iii_valid:
+                res.add_step("Test III：Change Port", "ok",
+                             f"收到来自 {r3.source[0]}:{r3.source[1]} 的响应")
+            else:
+                res.add_step("Test III：Change Port", "fail", r3.error or "无响应")
+        finally:
+            sock.close()
 
         if ii_valid:
             res.filtering_behavior = FILT_EIF
-        elif iii_valid:
+            return
+        if iii_valid:
             res.filtering_behavior = FILT_ADF
-        elif r2.error_kind == stun.ERR_TIMEOUT and r3.error_kind == stun.ERR_TIMEOUT:
-            # 只认结构化类别，不比对 error 的措辞（措辞一变这里就永久失效）
+            return
+
+        both_timeout = (
+            r2.error_kind == stun.ErrorKind.TIMEOUT.value
+            and r3.error_kind == stun.ErrorKind.TIMEOUT.value
+        )
+        if not both_timeout:
+            res.filtering_behavior = FILT_UNKNOWN
+            res.warnings.append("CHANGE-REQUEST 测试未能得出结论，过滤行为标记为不可测")
+            return
+
+        # 两个子测试都超时 —— 到底是 NAT 在过滤，还是服务器根本不实现
+        # change_port？只有后者被排除后，才允许判 APDF（端口受限）。
+        proven = self._prove_change_request_capability(usable, res)
+        if proven:
             res.filtering_behavior = FILT_APDF
+            res.notes.append(f"change_port 能力由 {proven} 正向证明，双超时 → APDF")
         else:
             res.filtering_behavior = FILT_UNKNOWN
+            res.warnings.append(
+                "Change-IP 与 Change-Port 均超时，但没有任何服务器能正向证明自己"
+                "会响应 change_port —— 无法区分『NAT 过滤』与『服务器不实现』，"
+                "过滤行为仅能确定『比 EIF 更严』"
+            )
 
-        if not ii_valid and not iii_valid and res.filtering_behavior == FILT_UNKNOWN:
-            res.warnings.append("CHANGE-REQUEST 测试未能得出结论，过滤行为标记为不可测")
+    def _change_request(self, sock, dst, change_ip: bool, change_port: bool, deadline: float):
+        """独立重试一次 CHANGE-REQUEST：最多 FILTER_ATTEMPTS 次，只对超时重试。"""
+        last = stun.BindingResult()
+        for attempt in range(FILTER_ATTEMPTS):
+            remain = deadline - time.perf_counter()
+            if remain <= 0.05:
+                break
+            last = stun.binding_transaction(
+                sock, dst,
+                change_ip=change_ip, change_port=change_port,
+                timeout=min(FILTER_TIMEOUT_S, remain),
+                attempts=1,  # 重试放在外层：每次都是新的 transaction id
+            )
+            if last.ok or last.error_kind != stun.ErrorKind.TIMEOUT.value:
+                break
+            if attempt < FILTER_ATTEMPTS - 1:
+                time.sleep(FILTER_RETRY_GAP_S)
+        return last
+
+    # ---- 阶段 1：能力诊断（允许预热，只用于解释超时） ----
+
+    def _prove_change_request_capability(self, usable, res: NatResult) -> str:
+        """正向证明「某台服务器真的会响应 change_port」，返回服务器标签或空串。
+
+        这里**允许预热**：先向预期的回包源地址发普通 Binding，把该 ip:port 加进
+        本机 NAT 白名单，再发 CHANGE-REQUEST。回答的是"服务器有没有这个能力"，
+        不是"NAT 放不放行"。绝不能拿这条通道做行为测量，所以每次都新开 socket
+        并在结束时关掉。
+        """
+        candidates = sorted(usable, key=lambda s: (0 if s.supports_rfc5780 else 1, s.rtt_ms))
+        for srv in candidates[:FILTER_CAP_CANDIDATES]:
+            ok, detail = self._probe_change_port_capability(srv)
+            res.notes.append(f"能力诊断 {srv.server.label}：{detail}")
+            self.log(f"能力诊断 {srv.server.label}：{detail}")
+            if ok:
+                return srv.server.label
+        return ""
+
+    def _probe_change_port_capability(self, srv: ProbeResult) -> tuple[bool, str]:
+        """在一次性 socket 上验证服务器是否会响应 change_port。"""
+        dst = (srv.ip, srv.server.port)
+        sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        try:
+            sock.bind(("", 0))
+            base = stun.binding_transaction(sock, dst, timeout=FILTER_CAP_TIMEOUT_S)
+            other = base.other if base.ok else None
+            if not base.ok:
+                return False, f"普通 Binding 无响应（{base.error or '超时'}）"
+            if not other:
+                return False, "响应未带 OTHER-ADDRESS / CHANGED-ADDRESS"
+            # 预热预期回包源：change_port 的回包来自 (dst_ip, other_port)，
+            # 顺带把 other 的 IP 也放进白名单，覆盖 ADF / APDF 两种过滤策略
+            stun.binding_transaction(sock, other, timeout=FILTER_CAP_TIMEOUT_S)
+            stun.binding_transaction(sock, (dst[0], other[1]), timeout=FILTER_CAP_TIMEOUT_S)
+            r = stun.binding_transaction(
+                sock, dst, change_port=True, timeout=FILTER_CAP_TIMEOUT_S, attempts=2
+            )
+            if r.ok and r.source and r.source[1] != dst[1]:
+                return True, f"change_port 有响应（源 {r.source[0]}:{r.source[1]}）"
+            return False, f"change_port 无响应（{r.error or '超时'}）"
+        finally:
+            sock.close()
 
     def _decide(self, res: NatResult) -> None:
         """综合两套模型给传统四类型。"""
