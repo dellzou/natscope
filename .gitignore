@@ -1,0 +1,16 @@
+# 构建产物
+build/
+dist/
+__pycache__/
+
+# Python
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+.pytest_cache/
+
+# 本地临时文件与导出的报告
+.tmp/
+*.log
+NatScope报告_*
