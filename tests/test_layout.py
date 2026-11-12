@@ -24,6 +24,7 @@
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 import unittest
@@ -204,6 +205,36 @@ class TestClampGeometry(unittest.TestCase):
         repaired = metrics.clamp_geometry("980x720+1000+500", self.WORK)
         self.assertIsNotNone(repaired, "相交约 70%，应当被接受并修复")
         self.assertEqual(repaired, "980x720+940+320")
+
+    def test_threshold_is_forty_percent(self):
+        """40% 是阈值：41% 接受并修复，39% 丢弃（team-lead 定的口径）。"""
+        # 980x720 在 y=745 时可见 980x295 ≈ 41%
+        self.assertIsNotNone(metrics.clamp_geometry("980x720+100+745", self.WORK))
+        # y=760 时可见 980x280 ≈ 39%
+        self.assertIsNone(metrics.clamp_geometry("980x720+100+760", self.WORK))
+
+    def test_window_straddling_two_monitors_is_accepted(self):
+        """跨屏摆放（一半在这屏、一半在那屏）是正常用法，必须能用。
+
+        接受之后可能被平移到**某一块**屏内完全可见——这比"丢回默认居中"好：
+        用户至少还能看到它、拖回来。
+        """
+        rects = [(0, 0, 1920, 1040), (1920, 0, 1920, 1040)]
+        repaired = metrics.clamp_geometry("980x720+1430+100", rects)
+        self.assertIsNotNone(repaired, "跨屏摆放不应被判为不可用")
+        match = re.match(r"(\d+)x(\d+)([+-]\d+)([+-]\d+)$", repaired or "")
+        self.assertIsNotNone(match, repaired)
+        w, h, x, y = (int(g) for g in match.groups())  # type: ignore[union-attr]
+        inside = any(
+            rx <= x and x + w <= rx + rw and ry <= y and y + h <= ry + rh
+            for rx, ry, rw, rh in rects
+        )
+        self.assertTrue(inside, f"修复结果 {repaired} 必须完整落在某块屏内")
+
+    def test_window_split_across_three_monitors(self):
+        """极端跨屏（各占 30%，合计 60%）：按并集面积算，仍应接受。"""
+        three = [(0, 0, 1920, 1040), (1920, 0, 1920, 1040), (3840, 0, 1920, 1040)]
+        self.assertIsNotNone(metrics.clamp_geometry("4000x720+1500+100", three))
 
     def test_barely_visible_is_rejected(self):
         """只露出约 20%：视为不合法（标题栏可能在屏幕外，拖不回来）。"""

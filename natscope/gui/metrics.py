@@ -341,26 +341,35 @@ def clamp_geometry(geo: str, work) -> str | None:
     x = int(match.group(3))
     y = int(match.group(4))
 
-    # 与哪个工作区交得最多，就认定窗口属于哪块屏
-    window_area = width * height
+    # 与哪个工作区交得最多，就认定窗口属于哪块屏。
+    #
+    # 判定口径：**相交面积 ÷ 窗口面积 >= 0.4**。"窗口面积"取"先按工作区尺寸
+    # 收缩后的窗口"——比屏幕还大的窗口本来就要缩到工作区（换小屏时窗口必须
+    # 能用），不能因为 4000x3000 只有左上角在屏内就判成不可用。
+    # 阈值 40% 的含义是"至少能看到小一半"，不是"必须大部分在屏内"：用户把
+    # 窗口拖到跨屏位置（一半在这屏一半在那屏）是完全正常的使用方式，
+    # 直接丢弃会让用户每次启动都要重新调窗口位置。
     best_rect = None
     best_area = 0
+    best_reference = 0
+    total_area = 0  # 跨多显示器时按"各屏交集之和"（并集面积，正常屏幕互不重叠）
     for rx, ry, rw, rh in rects:
-        iw = min(x + width, rx + rw) - max(x, rx)
-        ih = min(y + height, ry + rh) - max(y, ry)
+        probe_w = min(width, rw)
+        probe_h = min(height, rh)
+        iw = min(x + probe_w, rx + rw) - max(x, rx)
+        ih = min(y + probe_h, ry + rh) - max(y, ry)
         if iw <= 0 or ih <= 0:
             continue
         area = iw * ih
+        total_area += area
         if area > best_area:
             best_area = area
+            best_reference = probe_w * probe_h
             best_rect = (rx, ry, rw, rh)
-    if best_rect is None:
+    if best_rect is None or best_reference <= 0:
         return None
-    # 可见比例以"窗口面积与工作区面积中较小的那个"为分母：
-    # 比屏幕还大的窗口只要左上角在屏内就是可用的（会缩到屏幕大小），
-    # 而 980x720 跑到 +5000+5000 则一格都看不见。
-    reference = min(window_area, best_rect[2] * best_rect[3])
-    if best_area < 0.4 * reference:
+    # 跨屏窗口（一半在这块屏、一半在另一块）按并集面积算，照样能用
+    if total_area < 0.4 * best_reference:
         return None
 
     rx, ry, rw, rh = best_rect

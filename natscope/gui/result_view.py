@@ -308,7 +308,7 @@ class MatrixView(CanvasView):
             self._draw_overlay(matrix.note, row_head_w, grid_top, grid_w, grid_h)
         elif matrix.note and note_h > 0:
             self._label(
-                0, height - note_h + px(self.scale, 4), matrix.note,
+                0, height - note_h + px(self.scale, 4), "说明：" + matrix.note,
                 size=Typography.label, field="text_dim", limit=width - px(self.scale, 4),
             )
 
@@ -317,25 +317,29 @@ class MatrixView(CanvasView):
     ) -> None:
         palette = self.palette
         state = cell.state
+        # 上色一律用 display_tone（候选态统一 CANDIDATE_TONE）。直接拿 cell.tone
+        # 上色的话，cone_unknown 下「完全锥型」那格是绿的，读起来像「这个更可能」，
+        # 而结论恰恰是三者分不出来。导出图（report._Planner.matrix）用同一套。
+        tone = tone_color(palette, cell.display_tone)
         if state == viz.STATE_ACTIVE:
-            fill = tone_fill(palette, cell.tone, 0.18)
-            outline = tone_color(palette, cell.tone)
+            fill = blend(palette.surface, tone, 0.18)
+            outline = tone
             border = max(2, px(self.scale, 2))
-            ink = "text"
+            ink = ""  # 空串=用 tone 本色写标题（与导出图一致）
             bold = True
         elif state == viz.STATE_RELATED:
-            fill = tone_fill(palette, cell.tone, 0.10)
-            outline = blend(palette.surface, tone_color(palette, cell.tone), 0.65)
+            fill = palette.surface  # 无填充：只有统一描边 + 右上色点
+            outline = tone
             border = HAIRLINE
             ink = "text"
             bold = False
         elif state == viz.STATE_NA:
-            fill = palette.bg
+            fill = palette.overlay
             outline = palette.grid
             border = HAIRLINE
             ink = "text_faint"
             bold = False
-        else:  # dim
+        else:  # dim（已被实测排除：surface_alt + grid，强调度必须低于 related）
             fill = palette.surface_alt
             outline = palette.grid
             border = HAIRLINE
@@ -347,15 +351,24 @@ class MatrixView(CanvasView):
             round_rect_points(x0, y0, x0 + w, y0 + h, radius),
             fill=fill, outline=outline, width=border,
         )
+        if state == viz.STATE_RELATED:
+            # 右上角一个圆点：和描边一起表达"这一格还活着，但不是结论"
+            dot = max(2, px(self.scale, 3))
+            self.create_oval(
+                x0 + w - px(self.scale, 8) - dot, y0 + px(self.scale, 8) - dot,
+                x0 + w - px(self.scale, 8) + dot, y0 + px(self.scale, 8) + dot,
+                fill=tone, outline=tone,
+            )
         if state == viz.STATE_NA:
             return  # na 格只留底，文字由中央浮层承担，避免九格重复同一句话
 
+        ink_color = tone if not ink else self._ink(ink)
         center_x = x0 + w / 2.0
         if show_sub and h >= px(self.scale, 44):
-            self._label(
-                center_x, y0 + h / 2.0 - px(self.scale, 7), cell.title,
-                size=Typography.body, field=ink, bold=bold, anchor="center",
-                limit=w - px(self.scale, 8),
+            self.create_text(
+                center_x, y0 + h / 2.0 - px(self.scale, 7),
+                text=ellipsis(cell.title, font(Typography.body, bold=bold), w - px(self.scale, 8)),
+                fill=ink_color, font=font(Typography.body, bold=bold), anchor="center",
             )
             self._label(
                 center_x, y0 + h / 2.0 + px(self.scale, 9), cell.sub,
@@ -363,11 +376,11 @@ class MatrixView(CanvasView):
                 limit=w - px(self.scale, 8),
             )
         else:
-            self._label(
-                center_x, y0 + h / 2.0, cell.title,
-                size=Typography.body if h >= px(self.scale, 44) else Typography.label,
-                field=ink, bold=bold, anchor="center",
-                limit=w - px(self.scale, 4),
+            size = Typography.body if h >= px(self.scale, 44) else Typography.label
+            self.create_text(
+                center_x, y0 + h / 2.0,
+                text=ellipsis(cell.title, font(size, bold=bold), w - px(self.scale, 4)),
+                fill=ink_color, font=font(size, bold=bold), anchor="center",
             )
 
     def _draw_overlay(self, note: str, x0: float, y0: float, w: float, h: float) -> None:
@@ -413,16 +426,18 @@ class MatrixView(CanvasView):
                 x0 = origin_x + col_index * cell
                 y0 = origin_y + row_index * cell
                 state = cell_data.state
+                tone = tone_color(palette, cell_data.display_tone)
                 if state == viz.STATE_ACTIVE:
-                    fill = tone_color(palette, cell_data.tone)
-                    outline = fill
+                    fill = tone
+                    outline = tone
                     border = max(2, px(self.scale, 2))
                 elif state == viz.STATE_RELATED:
-                    fill = tone_fill(palette, cell_data.tone, 0.55)
-                    outline = tone_color(palette, cell_data.tone)
+                    # 候选：无填充 + 候选色描边（缩略图也得读成"不确定"）
+                    fill = palette.surface
+                    outline = tone
                     border = HAIRLINE
                 elif state == viz.STATE_NA:
-                    fill = palette.bg
+                    fill = palette.overlay
                     outline = palette.grid
                     border = HAIRLINE
                 else:
@@ -442,9 +457,19 @@ class MatrixView(CanvasView):
 
 
 class SpectrumView(CanvasView):
-    """类型谱：从"开放互联网"到"UDP 阻断"的横向色带 + 当前类型三角标记。"""
+    """类型谱：从"开放互联网"到"UDP 阻断"的横向色带 + 结论位置标记。
 
-    DEFAULT_HEIGHT = 72.0
+    标记的三种情况（与导出图 ``report._Planner.spectrum`` 逐条对齐）：
+
+    * ``current`` —— 段本身用类型色填充，段中心上方**一个**三角；
+    * ``candidate`` —— 连续候选段合成 ``viz.spectrum_span()`` 给出的**一个**
+      区间：整段画一条略高的胶囊（内部用卡片底色细线分段）、区间中央一个
+      三角、区间下方居中写 ``span.label``。三段各画一个三角会被读成"三个
+      都命中/挑一个"，而正确含义是"落在这三段构成的区间内"；
+    * 都没有 —— 不画标记。
+    """
+
+    DEFAULT_HEIGHT = 96.0
 
     def __init__(self, parent, palette, scale, *, height: float = 0.0, surface: str = ""):
         self._segments: tuple[viz.SpectrumSegment, ...] = ()
@@ -464,70 +489,121 @@ class SpectrumView(CanvasView):
             return
 
         palette = self.palette
+        warn = palette.warn
         head_h = px(self.scale, 20)
-        bar_h = max(px(self.scale, 12), px(self.scale, 16))
-        label_h = px(self.scale, 16)
-        bar_top = head_h + px(self.scale, 8)
+        bar_h = max(px(self.scale, 10), px(self.scale, 14))
+        bar_top = head_h + px(self.scale, 10)
         count = len(segments)
         gap = max(1, px(self.scale, 3))
         seg_w = max(1.0, (width - gap * (count - 1)) / float(count))
+        # score 只用于文案里的数值展示，几何一律按元组下标算
+        span = viz.spectrum_span(segments)
+        current = [s for s in segments if s.state == "current"]
 
-        self._heading("类型谱", "从左到右：P2P 友好度递减")
+        if current:
+            caption, caption_field = f"当前 · {current[0].label}", "text_dim"
+        elif span is not None:
+            caption, caption_field = "可能 · 落在区间内", "warn"
+        else:
+            caption, caption_field = "结论未定", "text_faint"
+        self._label(0, px(self.scale, 8), "类型谱",
+                    size=Typography.label, field="text_faint", bold=True)
+        self._label(width, px(self.scale, 8), caption,
+                    size=Typography.label, field=caption_field, anchor="ne", limit=width)
 
-        current_index = -1
+        if span is not None:
+            # 一条横跨候选区间的胶囊（上下各高 2px），内部用卡片底色分格
+            grow = px(self.scale, 2)
+            first_x = span.start * (seg_w + gap)
+            last_x = span.end * (seg_w + gap) + seg_w
+            self.create_polygon(
+                round_rect_points(first_x, bar_top - grow, last_x, bar_top + bar_h + grow,
+                                  bar_h / 2.0 + grow),
+                fill=blend(palette.surface, warn, 0.28), outline=warn, width=HAIRLINE,
+            )
+            for index in range(span.start, span.end):
+                divider = index * (seg_w + gap) + seg_w + gap / 2.0
+                self.create_line(
+                    divider, bar_top + px(self.scale, 1),
+                    divider, bar_top + bar_h - px(self.scale, 1),
+                    fill=palette.surface, width=HAIRLINE,
+                )
+
         for index, segment in enumerate(segments):
             x0 = index * (seg_w + gap)
             x1 = x0 + seg_w
+            in_span = span is not None and span.start <= index <= span.end
             if segment.state == "current":
                 fill = tone_color(palette, segment.tone)
                 outline = fill
-                border = HAIRLINE
-                current_index = index
+                ink, bold = "text", True
             elif segment.state == "candidate":
-                fill = blend(palette.surface, tone_color(palette, segment.tone), 0.55)
-                outline = tone_color(palette, segment.tone)
-                border = HAIRLINE
+                # 候选不跟各自语义色走（统一 warn）；区间条已画好时不再重复画
+                fill = blend(palette.surface, warn, 0.28)
+                outline = warn
+                ink, bold = "text_dim", False
             else:
-                fill = blend(palette.surface, tone_color(palette, segment.tone), 0.18)
+                fill = palette.overlay
                 outline = palette.grid
-                border = HAIRLINE
-            self.create_polygon(
-                round_rect_points(x0, bar_top, x1, bar_top + bar_h, min(px(self.scale, 3), bar_h / 2)),
-                fill=fill, outline=outline, width=border,
-            )
-            active = segment.state in ("current", "candidate")
+                ink, bold = "text_faint", False
+            if not in_span:
+                self.create_polygon(
+                    round_rect_points(x0, bar_top, x1, bar_top + bar_h,
+                                      min(px(self.scale, 3), bar_h / 2)),
+                    fill=fill, outline=outline, width=HAIRLINE,
+                )
             self._label(
-                x0 + seg_w / 2.0, bar_top + bar_h + px(self.scale, 4),
-                segment.label, size=Typography.label,
-                field="text" if active else "text_faint",
-                bold=segment.state == "current", anchor="n",
+                x0 + seg_w / 2.0, bar_top + bar_h + px(self.scale, 3),
+                segment.label, size=Typography.label, field=ink, bold=bold, anchor="n",
+                limit=seg_w - px(self.scale, 2),
+            )
+            self._label(
+                x0 + seg_w / 2.0, bar_top + bar_h + px(self.scale, 14),
+                segment.sub, size=Typography.label, field="text_faint", anchor="n",
                 limit=seg_w - px(self.scale, 2),
             )
 
-        if 0 <= current_index < count:
-            marker_x = current_index * (seg_w + gap) + seg_w / 2.0
-            half = px(self.scale, 5)
-            top = bar_top - px(self.scale, 5)
+        half = px(self.scale, 5)
+        if span is not None:
+            mid = (span.start * (seg_w + gap) + span.end * (seg_w + gap) + seg_w) / 2.0
+            base = bar_top - px(self.scale, 2)
             self.create_polygon(
-                marker_x, bar_top - 1,
-                marker_x - half, top,
-                marker_x + half, top,
-                fill=palette.text, outline="",
+                mid, base, mid - half, base - half, mid + half, base - half,
+                fill=warn, outline="",
+            )
+            self.create_text(
+                mid, bar_top + bar_h + px(self.scale, 25),
+                text=ellipsis(span.label, font(Typography.label),
+                              int((span.end - span.start + 1) * (seg_w + gap))),
+                fill=warn, font=font(Typography.label), anchor="n",
+            )
+        elif current:
+            marker_x = segments.index(current[0]) * (seg_w + gap) + seg_w / 2.0
+            base = bar_top - px(self.scale, 1)
+            self.create_polygon(
+                marker_x, base, marker_x - half, base - px(self.scale, 5),
+                marker_x + half, base - px(self.scale, 5),
+                fill=tone_color(palette, current[0].tone), outline="",
             )
 
     def _draw_collapsed(self, width: int, height: int, segments) -> None:
+        """窄宽度：单行摘要。候选区间只说"落在区间内"，不并列三个段名。"""
         current = [s for s in segments if s.state == "current"]
-        candidates = [s for s in segments if s.state == "candidate"]
+        span = viz.spectrum_span(segments)
         if current:
-            text = f"类型谱：当前为 {current[0].label}（{current[0].sub}），P2P 友好度 {current[0].score}/100"
-        elif candidates:
-            text = "类型谱：锥型（未细分）—— " + " / ".join(s.label for s in candidates)
+            text = (f"类型谱：当前为 {current[0].label}（{current[0].sub}），"
+                    f"P2P 友好度 {current[0].score}/100")
+            field = "text_dim"
+        elif span is not None:
+            text = f"类型谱：{span.label}"
+            field = "warn"
         else:
-            text = "类型谱：无明显位置（" + " → ".join(s.label for s in segments) + "）"
+            text = "类型谱：结论未定"
+            field = "text_faint"
         self._heading("类型谱")
         # 贴着标题写，不留居中造成的上下双空档（那看起来像画丢了内容）
         self._label(
-            0, px(self.scale, 32), text, size=Typography.body, field="text_dim",
+            0, px(self.scale, 32), text, size=Typography.body, field=field,
             anchor="w", limit=width,
         )
 
@@ -851,9 +927,21 @@ class ResultView(tk.Frame):
         self.gateway = GatewayStrip(holder, palette, scale, surface=self._surface)
         self.steps = StepsView(holder, palette, scale, surface=self._surface)
 
+        self._gap = gap
+        self._samples_visible = True
         for widget in (self.matrix, self.spectrum, self.samples,
                        self.scenarios, self.gateway, self.steps):
             widget.pack(fill="x", pady=(0, gap))
+
+    def _show_samples(self, visible: bool) -> None:
+        """无映射样本时把整块收起来（viz 约定 ``build_samples()`` 返回空元组）。"""
+        if visible == self._samples_visible:
+            return
+        self._samples_visible = visible
+        if visible:
+            self.samples.pack(fill="x", pady=(0, self._gap), before=self.scenarios)
+        else:
+            self.samples.pack_forget()
 
     # ---- 接口 ----
 
@@ -880,13 +968,16 @@ class ResultView(tk.Frame):
             self.scenarios.set_scenarios(())
             self.gateway.set_badges(())
             self.steps.set_steps(())
+            self._show_samples(True)
             return
+        chips = viz.build_samples(nat)
         self.matrix.set_matrix(viz.build_matrix(nat))
         self.spectrum.set_spectrum(viz.build_spectrum(nat))
-        self.samples.set_samples(viz.build_samples(nat))
+        self.samples.set_samples(chips)
         self.scenarios.set_scenarios(viz.build_scenarios(nat))
         self.gateway.set_badges(viz.build_badges(gateway))
         self.steps.set_steps(nat.steps)
+        self._show_samples(bool(chips))
 
 
 __all__ = [
