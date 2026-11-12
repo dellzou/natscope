@@ -13,6 +13,10 @@ CLI、单元测试、打包脚本都能以近乎零成本拿到品牌常量与�
 from __future__ import annotations
 
 import math
+from typing import TYPE_CHECKING, Any
+
+if TYPE_CHECKING:  # 仅供类型检查器，运行期不加载 Pillow
+    from PIL import Image
 
 # ---- 文本标识 -------------------------------------------------------------
 
@@ -114,12 +118,16 @@ def _mix(a: tuple[int, int, int], b: tuple[int, int, int], t: float) -> tuple[in
     )
 
 
-def layout(variant: str = "full") -> dict[str, object]:
+def layout(variant: str = "full") -> dict[str, Any]:
     """按造型展开几何参数，并整体平移让图形包围盒正好居中。
 
     返回值中的长度仍是 0..1 归一化值，调用方乘以边长即可得到像素坐标。
     除图形参数外还返回圆环圆弧的起止角度（PIL 角度制：0° 在 3 点钟方向、
     顺时针为正，与本模块的 y 轴向下的坐标约定一致）。
+
+    同时校验 ``ring_clearance``：绿点内缘不得贴住圆环外缘，否则缩到 16px
+    时两者会糊成一团。改几何参数后若违反该约束，这里会立刻抛 ValueError，
+    而不是等到肉眼看图标才发现。
     """
     g = MARK_GEOM
     simple = variant == "simple"
@@ -136,8 +144,13 @@ def layout(variant: str = "full") -> dict[str, object]:
     half = math.radians(float(g["gap_deg"]) / 2.0)
     ux, uy = math.cos(ang), math.sin(ang)
 
-    # 缺口两端的端点（位于圆环外半径上）由圆弧采样隐式给出
     ball_c = (cx + dist * ux, cy + dist * uy)
+    clearance = dist - ball_r - r_out
+    if clearance + 1e-9 < float(g["ring_clearance"]):
+        raise ValueError(
+            f"{variant} 造型下绿点与圆环的空白仅 {clearance:.4f}，"
+            f"低于 ring_clearance={float(g['ring_clearance']):.4f}"
+        )
 
     rod: tuple[tuple[float, float], ...] = ()
     if not simple:
@@ -183,7 +196,7 @@ def layout(variant: str = "full") -> dict[str, object]:
     }
 
 
-def _paint_tile(img: "object", size: int, corner_ratio: float) -> "object":
+def _paint_tile(img: "Image.Image", size: int, corner_ratio: float) -> "Image.Image":
     """在给定 RGBA 图上画深色圆角方底（带垂直渐变），返回圆角蒙版。"""
     from PIL import Image, ImageDraw
 
@@ -201,7 +214,7 @@ def _paint_tile(img: "object", size: int, corner_ratio: float) -> "object":
     return mask
 
 
-def render_mark(size: int, variant: str = "full") -> "object":
+def render_mark(size: int, variant: str = "full") -> "Image.Image":
     """把品牌图形渲染成 ``size × size`` 的 RGBA 图像（Pillow Image）。
 
     这里严格按目标尺寸绘制，不做内部超采样——超采样由调用方
@@ -216,25 +229,24 @@ def render_mark(size: int, variant: str = "full") -> "object":
     tile_mask = _paint_tile(img, size, float(lay["corner_radius"]))
 
     draw = ImageDraw.Draw(img)
-    ccx, ccy = lay["ring_center"]  # type: ignore[misc]
-    r_out = float(lay["ring_outer_r"])  # type: ignore[arg-type]
-    band = float(lay["ring_width"])  # type: ignore[arg-type]
-    cx, cy, rr = ccx * size, ccy * size, r_out * size
-    width = max(1, int(round(band * size)))
+    ccx, ccy = lay["ring_center"]
+    cx, cy = ccx * size, ccy * size
+    rr = float(lay["ring_outer_r"]) * size
+    width = max(1, int(round(float(lay["ring_width"]) * size)))
     draw.arc(
         [cx - rr, cy - rr, cx + rr, cy + rr],
-        start=float(lay["arc_start_deg"]),  # type: ignore[arg-type]
-        end=float(lay["arc_end_deg"]),  # type: ignore[arg-type]
+        start=float(lay["arc_start_deg"]),
+        end=float(lay["arc_end_deg"]),
         fill=BRAND_WHITE + (255,),
         width=width,
     )
 
-    rod = lay["rod"]  # type: ignore[assignment]
+    rod = lay["rod"]
     if rod:
         draw.polygon([(p[0] * size, p[1] * size) for p in rod], fill=BRAND_WHITE + (255,))
 
-    bcx, bcy = lay["ball_center"]  # type: ignore[misc]
-    br = float(lay["ball_r"]) * size  # type: ignore[arg-type]
+    bcx, bcy = lay["ball_center"]
+    br = float(lay["ball_r"]) * size
     draw.ellipse(
         [bcx * size - br, bcy * size - br, bcx * size + br, bcy * size + br],
         fill=BRAND_ACCENT + (255,),
