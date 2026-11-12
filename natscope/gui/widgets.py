@@ -203,6 +203,27 @@ def hairline(parent: tk.Misc, palette: Palette, orient: str = "h") -> tk.Frame:
     return tk.Frame(parent, bg=palette.border, height=HAIRLINE)
 
 
+def elevation(
+    parent: tk.Misc, palette: Palette, scale: float, rows: int = 0
+) -> tk.Frame:
+    """固定栏的"抬起"效果：几条 1px 横线，从上到下由 ``bg`` 渐变到 ``border``。
+
+    用途是底栏：固定栏与滚动内容同为 ``surface`` 时，1px 描边在缩略图/低分屏
+    上几乎看不见，滚动的内容（白色卡片）会和白色底栏糊成一片，读起来像"按钮
+    盖住了内容"。渐变阴影把两者分开，且它是**实色叠加**——Canvas 没有 alpha，
+    这里靠 :func:`blend` 预先算好每一行的颜色，任何 DPI 下都不会糊。
+    """
+    count = rows or max(2, px(scale, 3))
+    box = tk.Frame(parent, bg=palette.bg, bd=0, highlightthickness=0)
+    # 最上面那一行最浅、贴着底栏那一行最深：视线自然落到底栏边缘
+    for index in range(count):
+        ratio = 0.9 * (index + 1) / float(count)
+        tk.Frame(
+            box, bg=blend(palette.bg, palette.border, ratio), height=HAIRLINE
+        ).pack(side="top", fill="x")
+    return box
+
+
 def _parent_bg(widget: tk.Misc, fallback: str) -> str:
     try:
         return str(widget.cget("bg"))

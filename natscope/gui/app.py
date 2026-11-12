@@ -47,6 +47,7 @@ from .widgets import (
     LogoMark,
     PillButton,
     ScrollFrame,
+    elevation,
     font,
     hairline,
     px,
@@ -216,11 +217,16 @@ class App(tk.Tk):
         hairline(self, palette).pack(side="bottom", fill="x")
         bar = tk.Frame(self, bg=palette.surface)
         bar.pack(side="bottom", fill="x")
-        # 底栏**顶边**再来一条 1px 描边。底栏与卡片的 surface 同色，滚动内容
-        # （行为矩阵那一行）会从按钮正下方穿过去——没有这条线，看上去像"按钮
-        # 盖住了内容/渲染错位"。固定栏与滚动内容之间必须有视觉分隔。
-        # pack(side="bottom") 是按调用顺序自下而上堆叠，所以这条线在 bar 之上。
+        # 底栏**顶边**：一条 1px 描边 + 上方几像素渐变阴影（"抬起"效果）。
+        #
+        # 为什么不是只有 1px：底栏与卡片同为 surface，滚动内容从按钮正下方穿过
+        # 时，1px 在缩略图 / 低分屏上几乎看不出来，看上去就是"按钮盖住了内容"。
+        # 这里用 2~6 行实色 1px 线（bg → border 渐变）做出层次，Canvas 没有
+        # alpha，颜色由 blend() 预算，任何 DPI 下都清晰。
+        # pack(side="bottom") 按调用顺序自下而上堆叠，所以顺序必须是
+        # bar → 描边 → 阴影，画面才是「内容 | 阴影 | 描边 | 底栏」。
         hairline(self, palette).pack(side="bottom", fill="x")
+        elevation(self, palette, self._scale).pack(side="bottom", fill="x")
         row = tk.Frame(bar, bg=palette.surface)
         row.pack(fill="x", padx=pad, pady=px(self._scale, 9))
 
