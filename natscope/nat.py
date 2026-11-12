@@ -579,7 +579,8 @@ class NatDetector:
 
         这里只看属性（``supports_rfc5780`` 由探测阶段填好），因此绝不会有
         "顺手把 OTHER-ADDRESS 预热掉"的副作用。真能力验证放在
-        :meth:`_prove_change_request_capability`，只在需要区分 APDF 时触发。
+        :meth:`_probe_change_port_capability`，只在"这台自己测得双超时"时触发，
+        且**只验它自己**——证明者必须等于测量者。
         """
         known = [s for s in usable if s.supports_rfc5780]
         if not known:
@@ -632,93 +633,155 @@ class NatDetector:
     # ---- 阶段 2：行为测量（全新 socket，绝不预热） ----
 
     def _measure_filtering(self, srv: ProbeResult, usable, res: NatResult) -> None:
-        """在**新建的 socket** 上测 Test II / III。
+        """在**新建的 socket** 上测 Test II / III，并给出过滤行为。
 
-        为什么必须是新 socket：过滤表是按"本地 socket（内部端口）"记的。若复用
-        已经朝 OTHER-ADDRESS 发过包的 socket，Test II 的回包会被那张表的旧条目
-        放行，得到假的"完全锥型"。新 socket = 新内部端口 = 干净的过滤表。
+        两条硬规矩：
+
+        1. **测量通道必须是新 socket**。过滤表按"本地 socket（内部端口）"记账，
+           复用已经朝 OTHER-ADDRESS 发过包的 socket 会把 Test II 的回包放行，
+           得到假的"完全锥型"。
+        2. **证明者必须 = 测量者**。「A 会响应 change_port」不能证明「B 的两次
+           超时是 NAT 挡的」——B 自己没实现 change_port 也会两次超时。所以每台
+           服务器只能用**它自己的测量结果 + 它自己的能力自证**来下结论；这台
+           自证不了就换下一台重测，绝不拿别人的证据给它背书。
+        """
+        # 第一台是调用方选定的；后续候选只在"第一台无法自证"时启用
+        candidates = [srv]
+        for s in sorted(usable, key=lambda x: (0 if x.supports_rfc5780 else 1, x.rtt_ms)):
+            if s is not srv and s.supports_rfc5780 and len(candidates) < FILTER_CAP_CANDIDATES:
+                candidates.append(s)
+
+        unproven: list[str] = []
+        for index, candidate in enumerate(candidates):
+            first = index == 0
+            dst = (candidate.ip, candidate.server.port)
+            r2, r3 = self._measure_on(candidate, res, record_steps=first)
+            ii = bool(r2.ok and r2.source and r2.source[0] != dst[0])
+            iii = bool(r3.ok and r3.source and r3.source[1] != dst[1])
+            if ii:
+                res.filtering_behavior = FILT_EIF
+                if not first:
+                    self._set_step(res, "Test II：Change IP+Port", "ok",
+                                   f"改用 {candidate.server.label} 后收到源 IP 变化的回包")
+                self._set_step(res, "Test III：Change Port", "skip",
+                               f"{candidate.server.label}：Change-IP 已成功，无需再测")
+                if not first:
+                    res.notes.append(
+                        f"过滤测量改用 {candidate.server.label}，Change-IP 成功 → EIF"
+                    )
+                return
+            if iii:
+                res.filtering_behavior = FILT_ADF
+                if not first:
+                    self._set_step(res, "Test III：Change Port", "ok",
+                                   f"改用 {candidate.server.label} 后收到源端口变化的回包")
+                    res.notes.append(
+                        f"过滤测量改用 {candidate.server.label}，Change-Port 成功 → ADF"
+                    )
+                return
+
+            both_timeout = (
+                r2.error_kind == stun.ErrorKind.TIMEOUT.value
+                and r3.error_kind == stun.ErrorKind.TIMEOUT.value
+            )
+            if not both_timeout:
+                res.filtering_behavior = FILT_UNKNOWN
+                res.warnings.append(
+                    f"{candidate.server.label} 的 CHANGE-REQUEST 未得到可用结论"
+                    f"（{r2.error_kind or '空'}/{r3.error_kind or '空'}），"
+                    "过滤行为标记为不可测"
+                )
+                return
+
+            # 这台服务器自己测得"双超时"。到底是 NAT 在过滤，还是它自己不实现
+            # change_port？只有**它自己**能回答这个问题——拿别人的能力证据给它
+            # 背书，等于给用户的网络扣一顶莫须有的帽子。
+            proven, detail = self._probe_change_port_capability(candidate)
+            res.notes.append(f"能力诊断 {candidate.server.label}：{detail}")
+            self.log(f"能力诊断 {candidate.server.label}：{detail}")
+            if proven:
+                res.filtering_behavior = FILT_APDF
+                res.notes.append(
+                    f"change_port 能力由测量服务器 {candidate.server.label} 自己正向证明，"
+                    "双超时 → APDF"
+                )
+                return
+            unproven.append(candidate.server.label)
+
+        res.filtering_behavior = FILT_UNKNOWN
+        res.warnings.append(
+            "Change-IP 与 Change-Port 均超时，且没有任何一台测量服务器能**自己**证明会响应 "
+            f"change_port（已试 {len(unproven)} 台：{'、'.join(unproven)}）—— "
+            "无法区分『NAT 过滤』与『服务器不实现』，过滤行为仅能确定『比 EIF 更严』"
+        )
+
+    def _set_step(self, res: NatResult, name: str, status: str, detail: str) -> None:
+        """按名字覆盖已有步骤，避免重测后报告里出现同名步骤一 √ 一 ×（P1-10）。"""
+        for step in res.steps:
+            if step.name == name:
+                step.status = status
+                step.detail = detail
+                return
+        res.add_step(name, status, detail)
+
+    def _measure_on(
+        self, srv: ProbeResult, res: NatResult, record_steps: bool
+    ) -> tuple[stun.BindingResult, stun.BindingResult]:
+        """在一次性 socket 上跑 Test II / III，返回两次事务的**结构化结果**。
+
+        返回 BindingResult 而不是布尔值，是为了让调用方用 ``error_kind`` 判断
+        "是否超时"——比对错误文案会让底层措辞一变就失效（P1-2）。
         """
         dst = (srv.ip, srv.server.port)
         sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        r2 = r3 = stun.BindingResult(
+            error="未执行", error_kind=stun.ErrorKind.UNKNOWN.value
+        )
         try:
             sock.bind(("", 0))
-            meas_port = sock.getsockname()[1]
-            self.log(f"过滤测量通道 本地端口 {meas_port}，目标 {dst[0]}:{dst[1]}")
+            self.log(f"过滤测量通道 本地端口 {sock.getsockname()[1]}，目标 {dst[0]}:{dst[1]}")
             # 必须先建映射：CHANGE-REQUEST 的回包要落到这条映射上
             base = stun.binding_transaction(sock, dst, timeout=1.0)
             if not base.ok:
-                res.add_step(
-                    "Test II：Change IP+Port", "skip",
-                    f"新建测量通道后无法建立映射：{base.error or '超时'}",
-                )
-                res.add_step("Test III：Change Port", "skip", "同上")
-                res.filtering_behavior = FILT_UNKNOWN
+                if record_steps:
+                    res.add_step("Test II：Change IP+Port", "skip",
+                                 f"新建测量通道后无法建立映射：{base.error or '超时'}")
+                    res.add_step("Test III：Change Port", "skip", "同上")
                 res.warnings.append("过滤测量建链失败，过滤行为标记为不可测")
-                return
+                return r2, r3
 
             deadline = time.perf_counter() + FILTER_BUDGET_S
             r2 = self._change_request(sock, dst, True, True, deadline)
             ii_valid = bool(r2.ok and r2.source and r2.source[0] != dst[0])
-            if r2.ok and not ii_valid:
-                res.add_step(
-                    "Test II：Change IP+Port", "skip",
-                    "服务器忽略 CHANGE-REQUEST（回包源地址未变），测试无效",
-                )
-            elif ii_valid:
-                res.add_step("Test II：Change IP+Port", "ok",
-                             f"收到来自 {r2.source[0]}:{r2.source[1]} 的响应")
-            else:
-                res.add_step("Test II：Change IP+Port", "fail", r2.error or "无响应")
+            if record_steps:
+                if r2.ok and not ii_valid:
+                    self._set_step(res, "Test II：Change IP+Port", "skip",
+                                   "服务器忽略 CHANGE-REQUEST（回包源地址未变），测试无效")
+                elif ii_valid:
+                    self._set_step(res, "Test II：Change IP+Port", "ok",
+                                   f"收到来自 {r2.source[0]}:{r2.source[1]} 的响应")
+                else:
+                    self._set_step(res, "Test II：Change IP+Port", "fail", r2.error or "无响应")
 
             # 服务器会对连续的 CHANGE-REQUEST 限流/丢包：实测"同 socket 连发 9 个"
-            # 全部超时、"每次单发"24/26 台成功。背靠背发会让 Test III 无辜超时，
+            # 全部超时、"每次单发" 24/26 台成功。背靠背发会让 Test III 无辜超时，
             # 把地址受限型推成端口受限型。
             time.sleep(FILTER_GAP_S)
 
             r3 = self._change_request(sock, dst, False, True, deadline)
             iii_valid = bool(r3.ok and r3.source and r3.source[1] != dst[1])
-            if r3.ok and not iii_valid:
-                res.add_step(
-                    "Test III：Change Port", "skip",
-                    "服务器忽略 CHANGE-REQUEST（回包端口未变），测试无效",
-                )
-            elif iii_valid:
-                res.add_step("Test III：Change Port", "ok",
-                             f"收到来自 {r3.source[0]}:{r3.source[1]} 的响应")
-            else:
-                res.add_step("Test III：Change Port", "fail", r3.error or "无响应")
+            if record_steps:
+                if r3.ok and not iii_valid:
+                    self._set_step(res, "Test III：Change Port", "skip",
+                                   "服务器忽略 CHANGE-REQUEST（回包端口未变），测试无效")
+                elif iii_valid:
+                    self._set_step(res, "Test III：Change Port", "ok",
+                                   f"收到来自 {r3.source[0]}:{r3.source[1]} 的响应")
+                else:
+                    self._set_step(res, "Test III：Change Port", "fail", r3.error or "无响应")
         finally:
             sock.close()
-
-        if ii_valid:
-            res.filtering_behavior = FILT_EIF
-            return
-        if iii_valid:
-            res.filtering_behavior = FILT_ADF
-            return
-
-        both_timeout = (
-            r2.error_kind == stun.ErrorKind.TIMEOUT.value
-            and r3.error_kind == stun.ErrorKind.TIMEOUT.value
-        )
-        if not both_timeout:
-            res.filtering_behavior = FILT_UNKNOWN
-            res.warnings.append("CHANGE-REQUEST 测试未能得出结论，过滤行为标记为不可测")
-            return
-
-        # 两个子测试都超时 —— 到底是 NAT 在过滤，还是服务器根本不实现
-        # change_port？只有后者被排除后，才允许判 APDF（端口受限）。
-        proven = self._prove_change_request_capability(usable, res)
-        if proven:
-            res.filtering_behavior = FILT_APDF
-            res.notes.append(f"change_port 能力由 {proven} 正向证明，双超时 → APDF")
-        else:
-            res.filtering_behavior = FILT_UNKNOWN
-            res.warnings.append(
-                "Change-IP 与 Change-Port 均超时，但没有任何服务器能正向证明自己"
-                "会响应 change_port —— 无法区分『NAT 过滤』与『服务器不实现』，"
-                "过滤行为仅能确定『比 EIF 更严』"
-            )
+        return r2, r3
 
     def _change_request(self, sock, dst, change_ip: bool, change_port: bool, deadline: float):
         """独立重试一次 CHANGE-REQUEST：最多 FILTER_ATTEMPTS 次，只对超时重试。
@@ -747,24 +810,7 @@ class NatDetector:
             )
         return last
 
-    # ---- 阶段 1：能力诊断（允许预热，只用于解释超时） ----
-
-    def _prove_change_request_capability(self, usable, res: NatResult) -> str:
-        """正向证明「某台服务器真的会响应 change_port」，返回服务器标签或空串。
-
-        这里**允许预热**：先向预期的回包源地址发普通 Binding，把该 ip:port 加进
-        本机 NAT 白名单，再发 CHANGE-REQUEST。回答的是"服务器有没有这个能力"，
-        不是"NAT 放不放行"。绝不能拿这条通道做行为测量，所以每次都新开 socket
-        并在结束时关掉。
-        """
-        candidates = sorted(usable, key=lambda s: (0 if s.supports_rfc5780 else 1, s.rtt_ms))
-        for srv in candidates[:FILTER_CAP_CANDIDATES]:
-            ok, detail = self._probe_change_port_capability(srv)
-            res.notes.append(f"能力诊断 {srv.server.label}：{detail}")
-            self.log(f"能力诊断 {srv.server.label}：{detail}")
-            if ok:
-                return srv.server.label
-        return ""
+    # ---- 能力诊断（允许预热，只用于解释超时；证明者必须 = 测量者） ----
 
     def _probe_change_port_capability(self, srv: ProbeResult) -> tuple[bool, str]:
         """在一次性 socket 上验证服务器是否会响应 change_port。"""

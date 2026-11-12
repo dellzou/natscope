@@ -47,9 +47,9 @@ from natscope.nat import (
 from natscope.servers import ProbeResult, StunServer
 
 try:  # 作为包导入（python -m unittest tests.xxx）
-    from .nat_testkit import FakeStunNetwork, make_probe, run_detector
+    from .nat_testkit import Call, FakeStunNetwork, make_probe, run_detector
 except ImportError:  # discover -s tests 时 tests/ 在 sys.path 上
-    from nat_testkit import FakeStunNetwork, make_probe, run_detector  # type: ignore[no-redef]
+    from nat_testkit import Call, FakeStunNetwork, make_probe, run_detector  # type: ignore[no-redef]
 
 PRIMARY_HOST, PRIMARY_PORT = "stun-a.test", 3478
 PRIMARY_IP = "192.0.2.1"
@@ -669,6 +669,105 @@ class TestOutlierRecheck(unittest.TestCase):
         self.assertEqual(r1.filtering_behavior, r2.filtering_behavior)
         self.assertEqual(r1.classic_type, r2.classic_type)
         self.assertEqual(r1.mapping_behavior, r2.mapping_behavior)
+
+
+class PerServerCapabilityNetwork(FakeStunNetwork):
+    """只有 ``capable_dsts`` 里的服务器会响应 change_port（其余"未实现"）。"""
+
+    def __init__(self, *args, capable_dsts=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.capable_dsts = {tuple(d) for d in capable_dsts}
+
+    def __call__(self, sock, dest, change_ip=False, change_port=False,
+                 timeout=1.5, attempts=1):
+        if change_port and not change_ip and tuple(dest) not in self.capable_dsts:
+            self.calls.append(
+                Call(sock, tuple(dest), bool(change_ip), bool(change_port),
+                     int(attempts or 1), float(timeout if timeout is not None else 0.0))
+            )
+            r = stun.BindingResult()
+            r.error = self.timeout_text
+            r.error_kind = stun.ERR_TIMEOUT
+            return r
+        return super().__call__(sock, dest, change_ip, change_port, timeout, attempts)
+
+
+class TestCapabilityProverIsMeasurer(unittest.TestCase):
+    """P1-3 收紧：**证明者必须 = 测量者**，不许拿别的服务器的证据背书。
+
+    「A 会响应 change_port」不能证明「B 的两次超时是 NAT 挡的」——B 自己没实现
+    change_port 也会两次超时。拿 A 的证据判 B 的 APDF，等于给用户的网络扣一顶
+    莫须有的帽子。
+    """
+
+    def test_apdf_credit_names_the_measuring_server(self):
+        fake = FakeStunNetwork(PRIMARY, other=OTHER, filter_mode="apdf")
+        result = run_detector(
+            fake, [make_probe(*PRIMARY), make_probe(*SECOND, rfc5780=False, rtt=30.0)]
+        )
+        self.assertEqual(result.filtering_behavior, FILT_APDF)
+        self.assertTrue(
+            any("自己正向证明" in n for n in result.notes),
+            f"APDF 必须由测量服务器自己证明，notes={result.notes}",
+        )
+        self.assertEqual(result.rfc5780_server, "192.0.2.1:3478")
+
+    def test_unprovable_measurer_must_switch_to_a_self_proving_server(self):
+        # 主服务器不实现 change_port，第二台实现 → 必须换到第二台"自证 + 重测"
+        fake = PerServerCapabilityNetwork(
+            PRIMARY, other=OTHER, filter_mode="apdf", capable_dsts=[SECOND]
+        )
+        result = run_detector(
+            fake,
+            [make_probe(*PRIMARY, rtt=10.0), make_probe(*SECOND, rfc5780=True, rtt=30.0)],
+        )
+        self.assertEqual(result.filtering_behavior, FILT_APDF)
+        credit = [n for n in result.notes if "自己正向证明" in n]
+        self.assertTrue(credit, f"缺少自证记录，notes={result.notes}")
+        self.assertIn(
+            "192.0.2.2:3478", credit[0],
+            f"必须由能自证的第二台服务器背书，实际：{credit[0]}",
+        )
+
+    def test_no_server_can_self_prove_yields_unknown(self):
+        fake = FakeStunNetwork(
+            PRIMARY, other=OTHER, filter_mode="apdf", change_port_supported=False
+        )
+        result = run_detector(
+            fake, [make_probe(*PRIMARY), make_probe(*SECOND, rfc5780=True, rtt=30.0)]
+        )
+        self.assertEqual(result.filtering_behavior, FILT_UNKNOWN)
+        self.assertNotEqual(result.filtering_behavior, FILT_APDF)
+        self.assertTrue(
+            any("没有任何一台" in w for w in result.warnings),
+            f"降级必须写明原因，warnings={result.warnings}",
+        )
+
+
+class TestProbeBatchIsolation(unittest.TestCase):
+    """单台服务器探测异常不得拖垮整轮探测（`_probe_one_safe`）。"""
+
+    def test_one_server_raising_does_not_break_the_batch(self):
+        from natscope import servers as servers_mod
+        from natscope.servers import probe_servers
+
+        bad = StunServer("bad.test", 3478)
+        good = StunServer("good.test", 3478)
+
+        def fake_probe(server, timeout):
+            if server.host == "bad.test":
+                raise ValueError("模拟某一台服务器解析出畸形数据")
+            res = ProbeResult(server=server, ok=True, ip="198.51.100.7", rtt_ms=5.0)
+            return res
+
+        with mock.patch.object(servers_mod, "_probe_one", fake_probe):
+            results = probe_servers([bad, good], timeout=0.05, retry_timeout=0.05, workers=2)
+
+        self.assertEqual(len(results), 2, "整轮探测被单台异常打断了")
+        by_key = {r.server.key: r for r in results}
+        self.assertFalse(by_key["bad.test:3478"].ok)
+        self.assertIn("探测异常", by_key["bad.test:3478"].error)
+        self.assertTrue(by_key["good.test:3478"].ok, "正常服务器也必须被探测到")
 
 
 def struct_pack_h(value: int) -> bytes:
