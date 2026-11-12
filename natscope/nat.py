@@ -445,32 +445,18 @@ class NatDetector:
             res.samples.append(MappingSample(primary.ip, primary.server.port,
                                              mapped[0], mapped[1], primary.server.label))
 
-            # ---------- 过滤行为测量（阶段 2：全新 socket，绝不预热） ----------
-            #
-            # 【顺序与通道都不能动】这段必须排在**任何向 OTHER-ADDRESS / CHANGED-
-            # ADDRESS 发包的代码之前**，而且必须跑在**新建的 socket** 上。
-            #
-            # Test II 的判据是"回包源 IP 是否变成了另一个地址"，而服务器换源地址
-            # 后发来的地址正是它宣告的那个 other 地址。只要我们事先朝那个 ip:port
-            # 发过哪怕一个 UDP 包，NAT 就会为它建好入站许可（地址受限 / 端口受限
-            # 型都会），Test II 的回包被放行 → 判成 EIF → "完全锥型 / P2P 最佳"。
-            # 真机对照（stun.miwifi.com，各 5 次）：全新 socket 直接发 Change-IP
-            # 5/5 超时；先向 OTHER-ADDRESS 发一个包再发同一请求 5/5 成功。
-            cr_server = self._pick_change_request_server(usable)
-            if cr_server is None:
-                res.add_step("Test II：Change IP+Port", "skip", "无服务器声明支持 CHANGE-REQUEST")
-                res.add_step("Test III：Change Port", "skip", "无服务器声明支持 CHANGE-REQUEST")
-                res.filtering_behavior = FILT_UNKNOWN
-                res.warnings.append(
-                    "当前可用服务器均未声明 OTHER-ADDRESS / CHANGED-ADDRESS，"
-                    "过滤行为与传统四类型无法直接测量"
-                )
-            else:
-                res.change_request_supported = True
-                res.rfc5780_server = cr_server.server.label
-                self._measure_filtering(cr_server, usable, res)
-
             # ---------- 多服务器映射采样（对称型 / 映射行为） ----------
+            #
+            # 【铁律】映射采样必须**全部完成之后**才允许发出任何 CHANGE-REQUEST。
+            #
+            # 两个方向都有坑，而且是同一枚硬币的两面：
+            #  · 采样先、过滤后 → 采样朝 OTHER-ADDRESS 发的包会给 NAT 开白名单，
+            #    随后的 Test II 回包被放行 → 受限锥型被误判成"完全锥型"（P0-1）；
+            #  · 过滤先、采样后 → 被 CHANGE-REQUEST 打过的那台服务器的地址族，
+            #    后续映射会被 NAT 重新分配，采样拿到的端口与 Test I 不一致 →
+            #    EIM 被误判成"对称型"（P1-18）。真机对照：先发 change 再采样
+            #    3/3 不一致，先采样再发 change 3/3 一致。
+            # 再加上过滤测量本身跑在独立 socket 上，"谁先谁后"就同时安全了。
             others = [s for s in usable[1:] if s.ip != primary.ip][: max_samples - 1]
             # OTHER-ADDRESS 可能是同 IP 不同端口，用于分离"改端口"与"改 IP"
             alt_ports = self._other_address_probes(sock, primary)
@@ -498,9 +484,9 @@ class NatDetector:
                     "），本机可能处于多 WAN / 负载均衡环境，映射端口的一致性以端口为准"
                 )
 
-            # 离群样本复核：某个目的的映射端口与多数不一致时，先重发一次该目的。
-            # 这类离群值多为测量伪影（该地址刚被 CHANGE-REQUEST 碰过、NAT 给它
-            # 重新分配了端口），直接当成对称型证据会把 EIM 误判成 APDM。
+            # 离群样本复核（双保险）：单个样本的映射端口与多数不一致时重发一次该
+            # 目的，两次一致才采信。架构隔离解决"系统性污染"，这一层解决"偶发
+            # 抖动"——一个抖动样本就足以把 port_restricted 翻成 symmetric。
             self._recheck_outlier_samples(sock, res)
 
             distinct = {s.mapped_port for s in res.samples}
@@ -520,6 +506,25 @@ class NatDetector:
                 res.warnings.append("不同 IP 的可用 STUN 服务器不足 2 个，映射行为结论可能不准确")
 
             res.mapping_behavior = _mapping_mode(res.samples)
+
+            # ---------- 过滤行为测量（阶段 2：全新 socket，绝不预热） ----------
+            #
+            # 到这里映射采样已全部结束，任何 CHANGE-REQUEST 都不会再影响它。
+            # 而且这段必须跑在**新建的 socket** 上：过滤表按内部端口记账，新
+            # socket = 新账本，历史流量一条都不算数。
+            cr_server = self._pick_change_request_server(usable)
+            if cr_server is None:
+                res.add_step("Test II：Change IP+Port", "skip", "无服务器声明支持 CHANGE-REQUEST")
+                res.add_step("Test III：Change Port", "skip", "无服务器声明支持 CHANGE-REQUEST")
+                res.filtering_behavior = FILT_UNKNOWN
+                res.warnings.append(
+                    "当前可用服务器均未声明 OTHER-ADDRESS / CHANGED-ADDRESS，"
+                    "过滤行为与传统四类型无法直接测量"
+                )
+            else:
+                res.change_request_supported = True
+                res.rfc5780_server = cr_server.server.label
+                self._measure_filtering(cr_server, usable, res)
 
             # ---------- 综合判定 ----------
             self._decide(res)
@@ -604,13 +609,13 @@ class NatDetector:
 
         target = outliers[0]
         r = stun.binding_transaction(
-            sock, (target.dst_ip, target.dst_port), timeout=1.2
+            sock, (target.dst_ip, target.dst_port), timeout=1.2, attempts=2
         )
         if r.ok and r.mapped and r.mapped[1] == top_port:
             res.samples = [s for s in res.samples if s is not target]
             res.samples.append(
                 MappingSample(
-                    target.dst_ip, target.dst_port, r.mapped[0], r.mapped[1], target.label
+                    target.dst_ip, target.dst_port, r.mapped[0], r.mapped[1], target.server
                 )
             )
             res.notes.append(

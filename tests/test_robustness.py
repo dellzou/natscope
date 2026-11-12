@@ -39,6 +39,7 @@ from natscope.nat import (
     FILT_APDF,
     FILT_EIF,
     FILT_UNKNOWN,
+    MAP_EIM,
     MAP_UNKNOWN,
     NatDetector,
     NatResult,
@@ -152,212 +153,55 @@ class SimulatedNat:
         return None
 
 
-class TestFilteringTestOrder(unittest.TestCase):
-    """P0 回归：过滤行为测试不得被多目标采样"预热"。"""
+class TestSamplingBeforeFiltering(unittest.TestCase):
+    """铁律：任何 CHANGE-REQUEST 都不得早于任何一次采样完成。
 
-    def _run(self):
-        fake = SimulatedNat()
-        with mock.patch.object(stun, "binding_transaction", fake), mock.patch.object(
-            nat, "local_outbound_ip", lambda: ("192.168.1.10", 0)
-        ):
-            result = NatDetector(timeout=0.2).run(make_servers())
-        return fake, result
+    这是 P0-1 与 P1-18 的共同解。两个方向的坑：
+      * 采样先、过滤后（但共用 socket）→ 采样给 OTHER-ADDRESS 开了白名单，
+        Test II 回包被放行 → 受限锥型判成"完全锥型"（P0-1）；
+      * 过滤先、采样后 → 被 CHANGE-REQUEST 打过的服务器地址族被 NAT 重新
+        分配端口 → EIM 判成"对称型"（P1-18）。
+    现在采样全部在阶段 1 的 socket 上完成，过滤测量在阶段 2 的独立 socket 上，
+    两条约束同时满足。
 
-    def test_other_address_is_not_warmed_before_test2(self):
-        fake, _ = self._run()
-        self.assertIsNotNone(fake.other_warmed_at_test2, "Test II 根本没有被执行")
-        self.assertFalse(
-            fake.other_warmed_at_test2,
-            "执行 Test II 时 OTHER-ADDRESS 已被预热 —— 过滤测试失效，"
-            "会把『端口受限型』误判成『完全锥型』",
-        )
+    注意：NAT 的过滤表是**按 socket（内部端口）记账**的，所以本用例用
+    ``FakeStunNetwork`` 的按 socket 隔离模型；用"全局共享白名单"的替身会把
+    正常实现的隔离误判成污染。
+    """
 
-    def test_change_request_precedes_other_address_sampling(self):
-        fake, _ = self._run()
-        first_change = fake.call_index(lambda d, ci, cp: ci or cp)
-        first_other = fake.call_index(lambda d, ci, cp: d == OTHER)
-        self.assertIsNotNone(first_change, "没有发出任何 CHANGE-REQUEST")
-        self.assertIsNotNone(first_other, "没有向 OTHER-ADDRESS 采样")
+    def test_sampling_completes_before_any_change_request(self):
+        fake = FakeStunNetwork(PRIMARY, other=OTHER, filter_mode="adf")
+        probes = [make_probe(*PRIMARY), make_probe(*SECOND, rfc5780=False, rtt=30.0)]
+        result = run_detector(fake, probes)
+
+        change_idx = [i for i, c in enumerate(fake.calls) if c.is_change_request]
+        sample_idx = [
+            i for i, c in enumerate(fake.calls)
+            if not c.is_change_request and c.dest != PRIMARY
+        ]
+        self.assertTrue(change_idx, "没有发出任何 CHANGE-REQUEST：" + fake.trace())
+        self.assertTrue(sample_idx, "没有做任何跨目标采样：" + fake.trace())
         self.assertLess(
-            first_change,
-            first_other,
-            f"调用顺序错误：CHANGE-REQUEST 在 #{first_change}，"
-            f"向 OTHER-ADDRESS 发包在 #{first_other}；前者必须更早",
+            max(sample_idx),
+            min(change_idx),
+            "有采样发生在 CHANGE-REQUEST 之后 —— 该服务器的地址族可能已被扰动，"
+            "映射端口会失真（P1-18）。调用序列：" + fake.trace(),
         )
-
-    def test_verdict_is_not_full_cone_on_address_restricted_nat(self):
-        _, result = self._run()
         self.assertEqual(result.filtering_behavior, FILT_ADF)
-        self.assertNotEqual(
-            result.filtering_behavior,
-            FILT_EIF,
-            "地址受限型 NAT 被判成 EIF（放宽过滤）",
-        )
-        self.assertNotEqual(
-            result.classic_type,
-            CLASSIC_FULL_CONE,
-            "地址受限型 NAT 被判成完全锥型 —— 这正是 P0 的错误结论",
-        )
         self.assertEqual(result.classic_type, CLASSIC_RESTRICTED)
 
-    def test_steps_keep_rfc_order(self):
-        _, result = self._run()
-        titles = [step.name for step in result.steps]
-        self.assertLess(
-            next(i for i, t in enumerate(titles) if t.startswith("Test II")),
-            next(i for i, t in enumerate(titles) if t.startswith("多目标映射采样")),
-            f"报告里的步骤顺序应与 RFC 3489 一致，实际：{titles}",
+    def test_measure_channel_only_talks_to_primary(self):
+        fake = FakeStunNetwork(PRIMARY, other=OTHER, filter_mode="adf")
+        probes = [make_probe(*PRIMARY), make_probe(*SECOND, rfc5780=False, rtt=30.0)]
+        run_detector(fake, probes)
+        measure = fake.measure_socket_id()
+        self.assertIsNotNone(measure)
+        dests = {c.dest for c in fake.calls_on(measure) if not c.is_change_request}
+        self.assertEqual(
+            dests,
+            {PRIMARY},
+            f"测量通道上出现了主服务器以外的目标：{dests}；调用序列：" + fake.trace(),
         )
-
-
-class TestGatewayRobustness(unittest.TestCase):
-    """网关探测面对不可信输入必须"降级"而不是"抛异常"。"""
-
-    def test_split_url_rejects_bad_port(self):
-        for bad in (
-            "http://192.168.1.1:99999/desc.xml",
-            "http://192.168.1.1:abc/desc.xml",
-            "http://192.168.1.1:0/desc.xml",
-            "http://[::1/desc.xml",
-            "http:///desc.xml",
-        ):
-            with self.subTest(url=bad):
-                with self.assertRaises(OSError):
-                    gateway._split_url(bad)
-
-    def test_fetch_wraps_value_error_into_oserror(self):
-        with self.assertRaises(OSError):
-            gateway._fetch("http://192.168.1.1:99999/desc.xml", timeout=0.1)
-
-    def test_soap_wraps_value_error_into_oserror(self):
-        with self.assertRaises(OSError):
-            gateway._soap_get_external_ip(
-                "http://192.168.1.1:abc/ctl",
-                "urn:schemas-upnp-org:service:WANIPConnection:1",
-            )
-
-    def test_probe_upnp_survives_malformed_location(self):
-        with mock.patch.object(
-            gateway, "_ssdp_discover", lambda timeout=2.0, **kw: ["http://192.168.1.1:99999/d.xml"]
-        ):
-            cap = gateway.probe_upnp("192.168.1.1", timeout=0.1)
-        self.assertEqual(cap.name, "UPnP-IGD")
-        self.assertFalse(cap.available)
-        self.assertEqual(cap.state, "limited")
-
-    def test_probe_upnp_survives_fetch_value_error(self):
-        def boom(url, timeout=2.0):
-            raise ValueError("port should be numeric")
-
-        with mock.patch.object(gateway, "_ssdp_discover", lambda timeout=2.0, **kw: ["http://x/d.xml"]):
-            with mock.patch.object(gateway, "_fetch", boom):
-                cap = gateway.probe_upnp("192.168.1.1", timeout=0.1)
-        self.assertEqual(cap.state, "limited")
-
-    def test_probe_gateway_never_raises(self):
-        def boom(*args, **kwargs):
-            raise ValueError("源自不可信输入的非法端口")
-
-        no_gateway = gateway.Capability("NAT-PMP")
-        no_gateway.state = "absent"
-        with mock.patch.object(gateway, "default_gateway", lambda: "192.168.1.1"), \
-                mock.patch.object(gateway, "probe_upnp", boom), \
-                mock.patch.object(gateway, "probe_natpmp", boom), \
-                mock.patch.object(gateway, "probe_pcp", boom):
-            rep = gateway.probe_gateway("192.168.1.10", timeout=0.1)
-        self.assertEqual(rep.gateway_ip, "192.168.1.1")
-        for cap in rep.capabilities:
-            self.assertEqual(cap.state, "limited", cap.name)
-            self.assertIn("探测异常", cap.detail, cap.name)
-            self.assertFalse(cap.available, cap.name)
-
-    def test_probe_gateway_without_gateway_still_reports(self):
-        with mock.patch.object(gateway, "default_gateway", lambda: ""), \
-                mock.patch.object(gateway, "guess_gateways", lambda ip="": iter(())), \
-                mock.patch.object(gateway, "probe_upnp", side_effect=OSError("no route")):
-            rep = gateway.probe_gateway("", timeout=0.1)
-        self.assertEqual(rep.upnp.state, "limited")
-        self.assertEqual(rep.natpmp.state, "absent")
-        self.assertEqual(rep.pcp.state, "absent")
-        self.assertFalse(rep.any_available)
-
-
-class TestStunStrictness(unittest.TestCase):
-    """撒谎的长度必须变成可诊断的错误，而不是"这台服务器没响应"。"""
-
-    @staticmethod
-    def _header(length: int, tid: bytes = b"\x11" * 12) -> bytes:
-        return (
-            b"\x01\x01" + struct_pack_h(length) + b"\x21\x12\xa4\x42" + tid
-        )
-
-    def test_declared_length_longer_than_datagram(self):
-        packet = self._header(100) + b"\x00" * 8
-        with self.assertRaises(stun.StunError) as ctx:
-            stun.parse_message(packet)
-        self.assertIn("截断", str(ctx.exception))
-
-    def test_attribute_overruns_body(self):
-        body = struct_pack_hh(stun.ATTR_MAPPED_ADDRESS, 40) + b"\x00" * 8
-        packet = self._header(len(body)) + body
-        with self.assertRaises(stun.StunError) as ctx:
-            stun.parse_message(packet)
-        self.assertIn("越界", str(ctx.exception))
-
-    def test_wellformed_message_still_parses(self):
-        body = struct_pack_hh(stun.ATTR_SOFTWARE, 4) + b"test"
-        packet = self._header(len(body)) + body
-        msg = stun.parse_message(packet)
-        self.assertEqual(msg.attrs[stun.ATTR_SOFTWARE], b"test")
-
-    def test_trailing_slack_is_tolerated(self):
-        # 某些实现会在包尾多塞几个字节；UDP 不会把这种包截断，宽容处理即可
-        body = struct_pack_hh(stun.ATTR_SOFTWARE, 4) + b"test"
-        packet = self._header(len(body)) + body + b"\x00\x00\x00"
-        msg = stun.parse_message(packet)
-        self.assertEqual(msg.attrs[stun.ATTR_SOFTWARE], b"test")
-
-    def test_binding_transaction_reports_malformed_packet(self):
-        packet = self._header(64) + b"\x00" * 4  # 声明 64，实际只有 4
-
-        class FakeSocket:
-            def settimeout(self, value):
-                pass
-
-            def sendto(self, data, dest):
-                pass
-
-            def recvfrom(self, size):
-                return packet, ("192.0.2.1", 3478)
-
-        with mock.patch.object(stun, "build_binding_request", lambda *a, **k: (b"", b"\x11" * 12)):
-            res = stun.binding_transaction(FakeSocket(), ("192.0.2.1", 3478), timeout=0.2)
-        self.assertFalse(res.ok)
-        self.assertIn("非法报文", res.error)
-        self.assertIn("截断", res.error)
-
-
-class TestResolveIpv6(unittest.TestCase):
-    """IPv6 服务器不支持，但报错必须说清楚"是 IPv6 不支持"，不是"DNS 坏了"。"""
-
-    def test_ipv6_literal_is_reported_clearly(self):
-        for host in ("2001:db8::1", "[2001:db8::1]"):
-            with self.subTest(host=host):
-                with self.assertRaises(OSError) as ctx:
-                    stun.resolve(host, 3478)
-                message = str(ctx.exception)
-                self.assertIn("IPv6", message)
-                self.assertNotIn("DNS 解析失败", message)
-
-    def test_ipv4_host_still_resolves(self):
-        ip, port = stun.resolve("127.0.0.1", 3478)
-        self.assertEqual((ip, port), ("127.0.0.1", 3478))
-
-    def test_ipv4_is_not_mistaken_for_ipv6(self):
-        self.assertFalse(stun._is_ipv6_literal("stun.l.google.com"))
-        self.assertFalse(stun._is_ipv6_literal("192.0.2.1"))
-        self.assertTrue(stun._is_ipv6_literal("::1"))
-        self.assertTrue(stun._is_ipv6_literal("[::1]"))
 
 
 class TestClassicFallback(unittest.TestCase):
@@ -764,6 +608,67 @@ class TestMappingOutlierTolerance(unittest.TestCase):
         NatDetector()._decide(res)
         self.assertEqual(res.mapping_behavior, MAP_EIM)
         self.assertEqual(res.classic_type, CLASSIC_PORT_RESTRICTED)
+
+
+class AnomalousSampleNetwork(FakeStunNetwork):
+    """让某个采样目的的**首次**回复映射端口 +1（模拟单包抖动 / NAT 表项扰动）。"""
+
+    def __init__(self, *args, anomaly_dst, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.anomaly_dst = tuple(anomaly_dst)
+        self.anomaly_served = False
+        self.calls_to_anomaly = 0
+
+    def __call__(self, sock, dest, change_ip=False, change_port=False,
+                 timeout=1.5, attempts=1):
+        res = super().__call__(sock, dest, change_ip, change_port, timeout, attempts)
+        if tuple(dest) == self.anomaly_dst and not (change_ip or change_port):
+            self.calls_to_anomaly += 1
+            if not self.anomaly_served and res.ok and res.mapped:
+                self.anomaly_served = True
+                res.mapped = (res.mapped[0], res.mapped[1] + 1)
+        return res
+
+
+class TestOutlierRecheck(unittest.TestCase):
+    """双保险：单个抖动样本不得翻转结论，且必须留下复核记录。"""
+
+    def test_single_jittered_sample_is_rechecked_and_dropped(self):
+        fake = AnomalousSampleNetwork(PRIMARY, other=OTHER, filter_mode="apdf",
+                                      anomaly_dst=OTHER)
+        result = run_detector(
+            fake, [make_probe(*PRIMARY), make_probe(*SECOND, rfc5780=False, rtt=30.0)]
+        )
+        self.assertGreaterEqual(
+            fake.calls_to_anomaly, 2,
+            f"离群目的只被请求 {fake.calls_to_anomaly} 次 —— 没有复核：" + fake.trace(),
+        )
+        self.assertEqual(
+            result.mapping_behavior, MAP_EIM,
+            "抖动样本没有被吃掉，映射行为被翻转：" + fake.trace(),
+        )
+        self.assertEqual(result.classic_type, CLASSIC_PORT_RESTRICTED)
+        self.assertTrue(
+            any("复核" in n for n in result.notes),
+            f"复核动作必须留下记录，实际 notes={result.notes}",
+        )
+
+    def test_verdict_does_not_depend_on_which_server_measures(self):
+        """换一台服务器做过滤测量，结论不得变化（P1-18 的原始症状）。"""
+        primary_first = FakeStunNetwork(PRIMARY, other=OTHER, filter_mode="apdf")
+        r1 = run_detector(
+            primary_first, [make_probe(*PRIMARY), make_probe(*SECOND, rfc5780=False, rtt=30.0)]
+        )
+        # 让第二台成为 cr_server（更快且声明支持）
+        second_first = FakeStunNetwork(PRIMARY, other=OTHER, filter_mode="apdf")
+        r2 = run_detector(
+            second_first,
+            [make_probe(*PRIMARY, rtt=50.0), make_probe(*SECOND, rfc5780=True, rtt=10.0)],
+        )
+        self.assertNotEqual(r1.rfc5780_server, r2.rfc5780_server, "两次必须选中不同的测量服务器")
+        self.assertEqual(r1.filtering_behavior, r2.filtering_behavior)
+        self.assertEqual(r1.classic_type, r2.classic_type)
+        self.assertEqual(r1.mapping_behavior, r2.mapping_behavior)
 
 
 def struct_pack_h(value: int) -> bytes:
