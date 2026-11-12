@@ -1,0 +1,73 @@
+# SPDX-FileCopyrightText: 2026 ZouNing
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
+#
+# REUSE 3.3 元数据：给无法携带 SPDX 头的文件（二进制资产、Markdown、
+# 配置/清单文件）声明版权与许可归属。Python 源文件自带两行 SPDX 头，
+# 不在这里重复声明。
+version = 1
+
+SPDX-PackageName = "NatScope"
+SPDX-PackageSupplier = "ZouNing (https://github.com/dellzou)"
+SPDX-PackageDownloadLocation = "https://github.com/dellzou/NatScope"
+SPDX-PackageComment = "NAT 类型检测工具（RFC 3489 / RFC 5780 / UPnP / NAT-PMP / PCP）"
+
+[[annotations]]
+path = "assets/**"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 ZouNing"
+SPDX-License-Identifier = "PolyForm-Noncommercial-1.0.0"
+
+[[annotations]]
+path = "docs/**"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 ZouNing"
+SPDX-License-Identifier = "PolyForm-Noncommercial-1.0.0"
+
+[[annotations]]
+path = "**/*.md"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 ZouNing"
+SPDX-License-Identifier = "PolyForm-Noncommercial-1.0.0"
+
+[[annotations]]
+path = "**/*.toml"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 ZouNing"
+SPDX-License-Identifier = "PolyForm-Noncommercial-1.0.0"
+
+[[annotations]]
+path = "**/*.yml"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 ZouNing"
+SPDX-License-Identifier = "PolyForm-Noncommercial-1.0.0"
+
+[[annotations]]
+path = "**/*.spec"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 ZouNing"
+SPDX-License-Identifier = "PolyForm-Noncommercial-1.0.0"
+
+[[annotations]]
+path = "requirements.txt"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 ZouNing"
+SPDX-License-Identifier = "PolyForm-Noncommercial-1.0.0"
+
+[[annotations]]
+path = ".gitignore"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 ZouNing"
+SPDX-License-Identifier = "PolyForm-Noncommercial-1.0.0"
+
+[[annotations]]
+path = ".gitattributes"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 ZouNing"
+SPDX-License-Identifier = "PolyForm-Noncommercial-1.0.0"
+
+# 本文件自身
+[[annotations]]
+path = "REUSE.toml"
+precedence = "override"
+SPDX-FileCopyrightText = "2026 ZouNing"
+SPDX-License-Identifier = "PolyForm-Noncommercial-1.0.0"

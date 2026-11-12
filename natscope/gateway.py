@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 ZouNing
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """网关端口映射服务探测：UPnP-IGD、NAT-PMP (RFC 6886)、PCP (RFC 6887)。
 
 只做"能力识别"，不真正添加端口映射（避免在用户网关上留下残留条目）。

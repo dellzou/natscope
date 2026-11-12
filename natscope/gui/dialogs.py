@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 ZouNing
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """STUN 服务器管理弹窗。"""
 
 from __future__ import annotations

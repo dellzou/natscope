@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 ZouNing
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """NatScope 桌面入口。
 
 打包：pyinstaller natscope.spec

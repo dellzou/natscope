@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 ZouNing
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """内置 STUN 服务器池、并发可用性探测与分级。"""
 
 from __future__ import annotations

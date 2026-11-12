@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 ZouNing
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """STUN 协议实现（RFC 5389，向下兼容 RFC 3489）。
 
 只做 NAT 类型探测需要的那一小部分：Binding Request / Response、

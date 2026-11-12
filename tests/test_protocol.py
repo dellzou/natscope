@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 ZouNing
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """协议编解码与判定逻辑单元测试（不依赖真实网络）。
 
 运行：python -m unittest discover -s tests -v

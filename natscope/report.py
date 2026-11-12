@@ -1,3 +1,5 @@
+# SPDX-FileCopyrightText: 2026 ZouNing
+# SPDX-License-Identifier: PolyForm-Noncommercial-1.0.0
 """检测报告导出：纯文本 TXT 与卡片式 JPG 图片。"""
 
 from __future__ import annotations
