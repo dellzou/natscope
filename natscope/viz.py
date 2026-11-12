@@ -315,7 +315,7 @@ def build_matrix(nat: NatResult) -> Matrix:
     2. 映射与过滤行为都测得 —— **只有一格** ``active``（其余被实测排除，
        灰显而不是「可能」，把「可能」标成高亮会读出错误信息）；
     3. 映射行为测到、过滤行为不可测 —— 整行 ``related``：
-       锥型行标「锥型（未细分）」，对称型行标「ADM / APDM 未细分」；
+       锥型行标「锥型（三选一，无法细分）」，对称型行标「ADM / APDM 未细分」；
     4. 映射行为不可测 —— 9 格 ``dim``，并在 ``note`` 里说明原因。
     """
     classic = nat.classic_type or CLASSIC_UNKNOWN
@@ -375,7 +375,9 @@ def build_matrix(nat: NatResult) -> Matrix:
     if rows and filtering:
         note = "映射与过滤行为均已测得，结论落在高亮格。"
     elif mapping == MAP_EIM:
-        note = "锥型（未细分）：过滤行为不可测，无法区分三种锥型。"
+        # 措辞必须与类型谱的区间标签（spectrum_span().label）前半句逐字一致：
+        # 同一张图里两套说法会被读成「两个不同的状态」。
+        note = "锥型（三选一，无法细分）：过滤行为不可测，无法确认是完全 / 受限 / 端口受限锥型。"
 
     return Matrix(rows=MATRIX_ROWS, cols=MATRIX_COLS, cells=tuple(grid), note=note)
 

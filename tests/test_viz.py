@@ -180,7 +180,24 @@ class TestMatrixStructure(unittest.TestCase):
         for row in (MAP_ADM, MAP_APDM):
             for col in ALL_FILTERING:
                 self.assertEqual(mat.get(row, col).state, viz.STATE_DIM)
-        self.assertIn("锥型（未细分）", mat.note)
+        self.assertIn("锥型（三选一，无法细分）", mat.note)
+        self.assertIn("无法确认是完全 / 受限 / 端口受限锥型", mat.note)
+
+    def test_cone_wording_matches_between_matrix_and_spectrum(self):
+        """同一状态在矩阵说明与类型谱标签里必须是同一句话。
+
+        同一张图里出现「锥型（未细分）」和「锥型（三选一，无法细分）」两种
+        说法，用户会以为是两个不同的状态。
+        """
+        nat = NatResult(classic_type=CLASSIC_CONE_UNKNOWN)
+        note = viz.build_matrix(nat).note
+        span = viz.spectrum_span(viz.build_spectrum(nat))
+        self.assertIsNotNone(span)
+        assert span is not None
+        self.assertTrue(
+            note.startswith(span.label),
+            f"措辞不一致：矩阵 note={note!r} / 谱标签={span.label!r}",
+        )
 
     def test_open_and_blocked_are_all_not_applicable(self):
         for classic in (CLASSIC_OPEN, CLASSIC_BLOCKED):
