@@ -918,6 +918,81 @@ class TestReportStepOrder(unittest.TestCase):
         )
 
 
+class TestRecheckCaliberMatchesMappingMode(unittest.TestCase):
+    """P11 回归：复核的多数判据必须与 `_mapping_mode` 同口径（按出口分组）。
+
+    旧的复核用**全局**多数端口，而 `_mapping_mode` 用**按出口分组**的多数。
+    多 WAN 下两者打架：跨出口的样本永远判成"不一致" → 复核在恰好需要它的
+    机器上静默失效，还会吐一条假警告（真实原因只是双线出口）。
+    """
+
+    @staticmethod
+    def _sample(ip, port, mapped_ip, mapped_port, tag):
+        from natscope.nat import MappingSample
+
+        return MappingSample(ip, port, mapped_ip, mapped_port, tag)
+
+    def test_cross_egress_sample_is_not_an_outlier(self):
+        res = NatResult()
+        res.samples = [
+            self._sample("198.51.100.1", 3478, "203.0.113.7", 50000, "a"),
+            self._sample("198.51.100.2", 3478, "203.0.113.7", 50000, "b"),
+            self._sample("198.51.100.3", 3478, "203.0.113.7", 50000, "c"),
+            self._sample("198.51.100.4", 3478, "203.0.113.7", 50000, "d"),
+            # 另一条出口：端口当然不同，但这不是伪影
+            self._sample("198.51.100.9", 3479, "112.95.164.56", 60000, "e"),
+        ]
+        calls = []
+
+        def fake(sock, dest, **kwargs):
+            calls.append(dest)
+            return stun.BindingResult(ok=True, mapped=("112.95.164.56", 60000))
+
+        with mock.patch.object(stun, "binding_transaction", fake):
+            NatDetector()._recheck_outlier_samples(object(), res)
+
+        self.assertEqual(calls, [], "跨出口样本不该被当成离群去复核")
+        self.assertEqual(
+            [w for w in res.warnings if "不一致" in w], [],
+            f"不该产生误导性警告，warnings={res.warnings}",
+        )
+        self.assertEqual(len(res.samples), 5, "样本不该被丢弃")
+
+    def test_within_egress_outlier_is_still_rechecked(self):
+        res = NatResult()
+        res.samples = [
+            self._sample("198.51.100.1", 3478, "203.0.113.7", 50000, "a"),
+            self._sample("198.51.100.2", 3478, "203.0.113.7", 50000, "b"),
+            self._sample("198.51.100.3", 3478, "203.0.113.7", 50000, "c"),
+            # 同一出口内的单包抖动 —— 这个必须被复核纠正
+            self._sample("198.51.100.4", 3478, "203.0.113.7", 60000, "d"),
+        ]
+        calls = []
+
+        def fake(sock, dest, **kwargs):
+            calls.append(dest)
+            return stun.BindingResult(ok=True, mapped=("203.0.113.7", 50000))
+
+        with mock.patch.object(stun, "binding_transaction", fake):
+            NatDetector()._recheck_outlier_samples(object(), res)
+
+        self.assertEqual(calls, [("198.51.100.4", 3478)], "同出口离群样本必须被复核")
+        self.assertEqual({s.mapped_port for s in res.samples}, {50000})
+        self.assertTrue(any("复核" in n for n in res.notes), res.notes)
+
+    def test_fewer_than_three_samples_skips_recheck(self):
+        res = NatResult()
+        res.samples = [
+            self._sample("198.51.100.1", 3478, "203.0.113.7", 50000, "a"),
+            self._sample("198.51.100.2", 3478, "203.0.113.7", 60000, "b"),
+        ]
+        calls = []
+        with mock.patch.object(stun, "binding_transaction",
+                               lambda *a, **k: calls.append(a) or stun.BindingResult()):
+            NatDetector()._recheck_outlier_samples(object(), res)
+        self.assertEqual(calls, [], "2 个样本无法做多数裁决，不做复核")
+
+
 def struct_pack_h(value: int) -> bytes:
     import struct
 

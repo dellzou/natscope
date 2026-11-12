@@ -634,23 +634,35 @@ class NatDetector:
         return min(known, key=lambda s: s.rtt_ms)
 
     def _recheck_outlier_samples(self, sock, res: NatResult) -> None:
-        """对"映射端口与多数不一致"的单个离群样本，重发一次该目的。
+        """对"映射端口与同组多数不一致"的离群样本，重发一次该目的。
 
-        重测后与多数一致 → 用新样本替换（说明原值是伪影）；
-        仍不一致 → 保留原样本，但记一条提示（此时才可能是真的 APDM）。
+        重测后与组内多数一致 → 用新样本替换（说明原值是伪影）；
+        仍不一致 → 保留原样本并记一条提示（此时才可能是真的 APDM）。
 
-        只在存在**多数端口**（≥2 个样本一致）且离群样本唯一时才动手，
+        **口径必须与 `_mapping_mode` 一致：按公网出口 IP 分组，只在组内比多数。**
+        多 WAN 环境下不同出口的端口本来就不同，拿"全局多数"去比，跨出口的样本
+        永远判成不一致 → 复核在恰好需要它的机器上静默失效，还会吐一条"复核后
+        仍不一致"的假警告（真实原因只是双线出口）。
+
+        只在组内存在**多数端口**（≥2 个一致）且离群样本唯一时才动手，
         正常 EIM 环境下一次额外的包都不会发。
         """
-        if len(res.samples) < 3:
-            return
-        counts: dict[int, int] = {}
+        groups: dict[str, list[MappingSample]] = {}
         for s in res.samples:
+            groups.setdefault(s.mapped_ip or "", []).append(s)
+        group = max(groups.values(), key=len)
+        if len(group) < 3:
+            # 样本不足 3 个时不做多数裁决：1 好 1 坏在数学上分不出谁是伪影，
+            # 再测一次只是 2 选 1 的重新抛硬币。宁可让 _mapping_mode 报保守结论。
+            return
+
+        counts: dict[int, int] = {}
+        for s in group:
             counts[s.mapped_port] = counts.get(s.mapped_port, 0) + 1
         top_port, top_count = max(counts.items(), key=lambda kv: kv[1])
         if top_count < 2:
             return
-        outliers = [s for s in res.samples if s.mapped_port != top_port]
+        outliers = [s for s in group if s.mapped_port != top_port]
         if len(outliers) != 1 or counts[outliers[0].mapped_port] != 1:
             return
 
@@ -658,7 +670,8 @@ class NatDetector:
         r = stun.binding_transaction(
             sock, (target.dst_ip, target.dst_port), timeout=1.2, attempts=2
         )
-        if r.ok and r.mapped and r.mapped[1] == top_port:
+        same_egress = not target.mapped_ip or (r.mapped and r.mapped[0] == target.mapped_ip)
+        if r.ok and r.mapped and r.mapped[1] == top_port and same_egress:
             res.samples = [s for s in res.samples if s is not target]
             res.samples.append(
                 MappingSample(
