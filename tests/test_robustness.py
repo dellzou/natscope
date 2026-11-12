@@ -822,6 +822,102 @@ class TestReportedServerMatchesMeasurer(unittest.TestCase):
         self.assertIn("192.0.2.2:3478", credit[0])
 
 
+class FirstServerOserrorNetwork(FakeStunNetwork):
+    """首台服务器的 CHANGE-REQUEST 返回 OSError（模拟该台此刻不可达）。"""
+
+    def __init__(self, *args, broken=(), **kwargs):
+        super().__init__(*args, **kwargs)
+        self.broken = {tuple(d) for d in broken}
+
+    def __call__(self, sock, dest, change_ip=False, change_port=False,
+                 timeout=1.5, attempts=1):
+        if (change_ip or change_port) and tuple(dest) in self.broken:
+            self.calls.append(
+                Call(sock, tuple(dest), bool(change_ip), bool(change_port),
+                     int(attempts or 1), float(timeout if timeout is not None else 0.0))
+            )
+            r = stun.BindingResult()
+            r.error = "network unreachable"
+            r.error_kind = stun.ERR_OSERROR
+            return r
+        return super().__call__(sock, dest, change_ip, change_port, timeout, attempts)
+
+
+class TestFirstServerFailureDoesNotAbort(unittest.TestCase):
+    """P10 回归：首台出现"非超时异常"时必须换下一台，而不是直接判不可测。
+
+    真机症状：同一台机器时而 port_restricted、时而 cone_unknown，取决于 RTT
+    排序恰好选中哪台当首台。真值是 port_restricted，等于把可达的精度白丢了。
+    """
+
+    def test_oserror_on_first_server_switches_to_next(self):
+        fake = FirstServerOserrorNetwork(
+            PRIMARY, other=OTHER, filter_mode="apdf", broken=[PRIMARY]
+        )
+        result = run_detector(
+            fake,
+            [make_probe(*PRIMARY, rtt=10.0), make_probe(*SECOND, rfc5780=True, rtt=30.0)],
+        )
+        measured = {c.dest for c in fake.calls if c.is_change_request}
+        self.assertIn(SECOND, measured, f"第二台根本没被尝试：{measured}")
+        self.assertEqual(
+            result.filtering_behavior, FILT_APDF,
+            f"首台异常导致整轮放弃 → {result.filtering_behavior!r}；调用序列：" + fake.trace(),
+        )
+        self.assertEqual(result.classic_type, CLASSIC_PORT_RESTRICTED)
+
+    def test_all_servers_broken_reports_unknown_with_reason(self):
+        fake = FirstServerOserrorNetwork(
+            PRIMARY, other=OTHER, filter_mode="apdf", broken=[PRIMARY, SECOND]
+        )
+        result = run_detector(
+            fake,
+            [make_probe(*PRIMARY, rtt=10.0), make_probe(*SECOND, rfc5780=True, rtt=30.0)],
+        )
+        self.assertEqual(result.filtering_behavior, FILT_UNKNOWN)
+        self.assertTrue(
+            any("都无法完成" in w or "不可测" in w for w in result.warnings),
+            f"全不可用时必须说明原因，warnings={result.warnings}",
+        )
+
+
+class TestReportStepOrder(unittest.TestCase):
+    """展示层：报告步骤按 RFC 3489 叙事排序，不泄漏内部执行顺序。"""
+
+    def test_steps_follow_rfc_narrative(self):
+        fake = FakeStunNetwork(PRIMARY, other=OTHER, filter_mode="apdf")
+        result = run_detector(
+            fake, [make_probe(*PRIMARY), make_probe(*SECOND, rfc5780=False, rtt=30.0)]
+        )
+        names = [s.name for s in result.steps]
+        order = ["Test I", "Test II", "Test III", "多目标映射采样", "判定"]
+        positions = []
+        for prefix in order:
+            idx = next((i for i, n in enumerate(names) if n.startswith(prefix)), None)
+            self.assertIsNotNone(idx, f"缺少步骤 {prefix}：{names}")
+            positions.append(idx)
+        self.assertEqual(
+            positions, sorted(positions),
+            f"步骤展示顺序应遵循 RFC 叙事 {order}，实际：{names}",
+        )
+
+    def test_unknown_step_names_keep_relative_order_and_go_last(self):
+        from natscope.nat import NatResult, _reorder_steps
+
+        res = NatResult()
+        res.add_step("多目标映射采样", "ok", "")
+        res.add_step("自定义步骤甲", "ok", "")
+        res.add_step("Test II：Change IP+Port", "fail", "")
+        res.add_step("自定义步骤乙", "ok", "")
+        res.add_step("Test I：获取映射地址", "ok", "")
+        _reorder_steps(res)
+        self.assertEqual(
+            [s.name for s in res.steps],
+            ["Test I：获取映射地址", "Test II：Change IP+Port",
+             "多目标映射采样", "自定义步骤甲", "自定义步骤乙"],
+        )
+
+
 def struct_pack_h(value: int) -> bytes:
     import struct
 

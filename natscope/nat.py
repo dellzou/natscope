@@ -269,6 +269,45 @@ _NON_ROUTABLE_NETS = tuple(
 )
 
 
+#: 报告里步骤的**展示顺序**（按名字前缀给权重，不写死索引——以后插新步骤不会错位）。
+#:
+#: 用户读到的是 RFC 3489 的叙事顺序；真实执行顺序是"先采样、后过滤"（见 run()
+#: 里的铁律注释），那是实现细节，不该泄漏到报告里让读者困惑"为什么先做别的再测过滤"。
+#: 只影响展示，不改任何判定结果与 status。
+_STEP_ORDER = {
+    "Test I": 10,
+    "Test II": 20,
+    "Test III": 30,
+    "多目标映射采样": 40,
+    "能力诊断": 50,
+    "判定": 60,
+}
+#: 未列入 _STEP_ORDER 的步骤排在这些之后，并保持原有相对顺序
+_STEP_RANK_UNKNOWN = 900
+
+
+def _step_kind(name: str) -> str:
+    """取步骤名的"类别"部分：``Test II：Change IP+Port`` → ``Test II``。
+
+    不能按前缀匹配：``"Test II…".startswith("Test I")`` 也是 True，会把
+    Test II 误判成 Test I 的权重。
+    """
+    for sep in ("：", ":"):
+        if sep in name:
+            return name.split(sep, 1)[0].strip()
+    return name.strip()
+
+
+def _step_rank(name: str) -> int:
+    """按类别取展示权重；未登记类别返回 ``_STEP_RANK_UNKNOWN``。"""
+    return _STEP_ORDER.get(_step_kind(name), _STEP_RANK_UNKNOWN)
+
+
+def _reorder_steps(res: NatResult) -> None:
+    """把 ``res.steps`` 重排成 RFC 叙事顺序（稳定排序：同权重保持原相对顺序）。"""
+    res.steps = sorted(res.steps, key=lambda step: _step_rank(step.name))
+
+
 def _is_routable(ip: str) -> bool:
     """该地址能否当作"公网采样目标/预热目标"：排除私网 / 环回 / 链路本地 / CGNAT / 组播。
 
@@ -533,6 +572,8 @@ class NatDetector:
 
             # ---------- 综合判定 ----------
             self._decide(res)
+            # 展示层：报告按 RFC 3489 叙事顺序呈现（详见 _STEP_ORDER 注释）
+            _reorder_steps(res)
             res.ok = True
             res.duration_ms = (time.perf_counter() - t_start) * 1000
             self.log(f"判定完成：{res.classic_label}")
